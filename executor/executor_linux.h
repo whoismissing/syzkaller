@@ -182,7 +182,8 @@ static bool cover_check(uint64 pc)
 {
 #if defined(__i386__) || defined(__x86_64__)
 	// Text/modules range for x86_64.
-	return pc >= 0xffffffff80000000ull && pc < 0xffffffffff000000ull;
+	// modify check to support obj_cov
+	return (pc & 0xffffffff) >= 0x80000000ull && (pc & 0xffffffff) < 0xff000000ull;
 #else
 	return true;
 #endif

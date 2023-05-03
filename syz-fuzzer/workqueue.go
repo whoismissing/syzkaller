@@ -20,6 +20,7 @@ type WorkQueue struct {
 	candidate       []*WorkCandidate
 	triage          []*WorkTriage
 	smash           []*WorkSmash
+	seed            []*WorkSeed
 
 	procs          int
 	needCandidates chan struct{}
@@ -31,6 +32,7 @@ const (
 	ProgCandidate ProgTypes = 1 << iota
 	ProgMinimized
 	ProgSmashed
+	ProgTriageObj
 	ProgNormal ProgTypes = 0
 )
 
@@ -41,7 +43,8 @@ const (
 type WorkTriage struct {
 	p     *prog.Prog
 	call  int
-	info  ipc.CallInfo
+	// info  ipc.CallInfo
+	progInfo *ipc.ProgInfo
 	flags ProgTypes
 }
 
@@ -59,6 +62,13 @@ type WorkCandidate struct {
 type WorkSmash struct {
 	p    *prog.Prog
 	call int
+}
+
+// WorkSeed are seeds that cause crashes.
+// we keep mutating seed to find different behaviors of the same bug.
+type WorkSeed struct {
+	p     *prog.Prog
+	flags ProgTypes
 }
 
 func newWorkQueue(procs int, needCandidates chan struct{}) *WorkQueue {
@@ -82,6 +92,8 @@ func (wq *WorkQueue) enqueue(item interface{}) {
 		wq.candidate = append(wq.candidate, item)
 	case *WorkSmash:
 		wq.smash = append(wq.smash, item)
+	case *WorkSeed:
+		wq.seed = append(wq.seed, item)
 	default:
 		panic("unknown work type")
 	}
@@ -89,14 +101,18 @@ func (wq *WorkQueue) enqueue(item interface{}) {
 
 func (wq *WorkQueue) dequeue() (item interface{}) {
 	wq.mu.RLock()
-	if len(wq.triageCandidate)+len(wq.candidate)+len(wq.triage)+len(wq.smash) == 0 {
+	if len(wq.triageCandidate)+len(wq.candidate)+len(wq.triage)+len(wq.smash)+len(wq.seed) == 0 {
 		wq.mu.RUnlock()
 		return nil
 	}
 	wq.mu.RUnlock()
 	wq.mu.Lock()
 	wantCandidates := false
-	if len(wq.triageCandidate) != 0 {
+	if len(wq.seed) != 0 {
+		last := len(wq.seed) - 1
+		item = wq.seed[last]
+		wq.seed = wq.seed[:last]
+	} else if len(wq.triageCandidate) != 0 {
 		last := len(wq.triageCandidate) - 1
 		item = wq.triageCandidate[last]
 		wq.triageCandidate = wq.triageCandidate[:last]

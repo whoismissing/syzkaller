@@ -88,7 +88,7 @@ func (target *Target) calcResourceUsage() map[string]map[int]weights {
 				str := "res"
 				for i, k := range a.Desc.Kind {
 					str += "-" + k
-					w := 1.0
+					w := 1.0 * 10
 					if i < len(a.Desc.Kind)-1 {
 						w = 0.2
 					}
@@ -221,6 +221,14 @@ type ChoiceTable struct {
 	calls  []*Syscall
 }
 
+func (target *Target) debugLogPrios(prios [][]float32) {
+	for i := range target.Syscalls {
+		for j := range target.Syscalls {
+			fmt.Printf("%v -> %v : %v\n", target.Syscalls[i].Name, target.Syscalls[j].Name, prios[i][j])
+		}
+	}
+}
+
 func (target *Target) BuildChoiceTable(corpus []*Prog, enabled map[*Syscall]bool) *ChoiceTable {
 	if enabled == nil {
 		enabled = make(map[*Syscall]bool)
@@ -252,6 +260,10 @@ func (target *Target) BuildChoiceTable(corpus []*Prog, enabled map[*Syscall]bool
 		}
 	}
 	prios := target.CalculatePriorities(corpus)
+
+	// debug log
+	// target.debugLogPrios(prios)
+
 	run := make([][]int, len(target.Syscalls))
 	for i := range run {
 		if !enabled[target.Syscalls[i]] {
@@ -269,21 +281,57 @@ func (target *Target) BuildChoiceTable(corpus []*Prog, enabled map[*Syscall]bool
 	return &ChoiceTable{target, run, enabledCalls}
 }
 
+func (target *Target) BuildCorpusChoiceTable(corpus []*Prog, corpusSyscall map[string]bool) *ChoiceTable {
+	// FIXME: for building choicetable, the syscall enabled should have a check on
+	// the resource relation before the choice table is built, here we do not have
+	// this check which may result in bias on unenabled syscalls. the quick fix rebaise
+	// a enabled syscall.
+
+	enabled := make(map[*Syscall]bool)
+
+	for _, p := range corpus {
+		for _, call := range p.Calls {
+			enabled[call.Meta] = true
+		}
+	}
+	for callName := range corpusSyscall {
+		enabled[target.SyscallMap[callName]] = true
+	}
+
+	return target.BuildChoiceTable(corpus, enabled)
+}
+
 func (ct *ChoiceTable) Enabled(call int) bool {
 	return ct.runs[call] != nil
 }
 
 func (ct *ChoiceTable) choose(r *rand.Rand, bias int) int {
-	if bias < 0 {
+	if bias < 0 || !ct.Enabled(bias) {
 		bias = ct.calls[r.Intn(len(ct.calls))].ID
 	}
-	if !ct.Enabled(bias) {
-		fmt.Printf("bias to disabled syscall %v", ct.target.Syscalls[bias].Name)
-		panic("disabled syscall")
+	for {
+		if !ct.Enabled(bias) {
+			fmt.Printf("bias to disabled syscall %v, rebiasing...", ct.target.Syscalls[bias].Name)
+			// panic("disabled syscall")
+			bias = ct.calls[r.Intn(len(ct.calls))].ID
+			// FIXME
+		} else {
+			break
+		}
 	}
 	run := ct.runs[bias]
-	x := r.Intn(run[len(run)-1]) + 1
-	res := sort.SearchInts(run, x)
+	// log.Logf(0, "bias call: %v\n", ct.target.Syscalls[bias].Name)
+	// log.Logf(0, "run: %v\n", run)
+	// log.Logf(0, "r.Intn : %v\n", run[len(run)-1]+2)
+	// FIXME: bug here, sometimes run[len(run)-1] == 0
+	var res int
+	if run[len(run)-1] < 0 {
+		res = ct.calls[r.Intn(len(ct.calls))].ID
+		panic("FIXME: table is wrong!")
+	} else {
+		x := r.Intn(run[len(run)-1]) + 1
+		res = sort.SearchInts(run, x)
+	}
 	if !ct.Enabled(res) {
 		panic("selected disabled syscall")
 	}

@@ -15,6 +15,7 @@ type RPCInput struct {
 	Call   string
 	Prog   []byte
 	Signal signal.Serial
+	ObjSig signal.Serial
 	Cover  []uint32
 }
 
@@ -36,6 +37,8 @@ type ConnectRes struct {
 	CheckResult      *CheckArgs
 	MemoryLeakFrames []string
 	DataRaceFrames   []string
+	ProgSeed         []byte
+	SpliceEnabled    bool
 }
 
 type CheckArgs struct {

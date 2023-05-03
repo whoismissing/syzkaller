@@ -540,6 +540,56 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	return r.generateParticularCall(s, meta)
 }
 
+func (r *randGen) generateResUseCall(s *state, p *Prog, insertionPoint int) []*Call {
+	biasCall := -1
+	callList := make([]int, 0)
+	for idx, call := range p.Calls {
+		meta := call.Meta
+		res := p.Target.getOutputResources(meta)
+		if len(res) != 0 {
+			callList = append(callList, idx)
+		}
+	}
+
+	if len(callList) > 0 {
+		// Choosing the base call is based on the insertion point of the new calls sequence.
+		biasCall = p.Calls[callList[r.Intn(len(callList))]].Meta.ID
+	}
+
+	for {
+		idx := s.ct.choose(r.Rand, biasCall)
+		meta := r.target.Syscalls[idx]
+		if len(p.Target.getOutputResources(meta)) == 0 {
+			return r.generateParticularCall(s, meta)
+		}
+	}
+}
+
+func (r *randGen) generateResCall(s *state, p *Prog, insertionPoint int) []*Call {
+	biasCall := -1
+	callList := make([]int, 0)
+	for idx, call := range p.Calls {
+		meta := call.Meta
+		res := p.Target.getOutputResources(meta)
+		if len(res) != 0 {
+			callList = append(callList, idx)
+		}
+	}
+
+	if len(callList) > 0 {
+		// Choosing the base call is based on the insertion point of the new calls sequence.
+		biasCall = p.Calls[callList[r.Intn(len(callList))]].Meta.ID
+	}
+
+	for {
+		idx := s.ct.choose(r.Rand, biasCall)
+		meta := r.target.Syscalls[idx]
+		if len(p.Target.getOutputResources(meta)) != 0 {
+			return r.generateParticularCall(s, meta)
+		}
+	}
+}
+
 func (r *randGen) generateParticularCall(s *state, meta *Syscall) (calls []*Call) {
 	if meta.Attrs.Disabled {
 		panic(fmt.Sprintf("generating disabled call %v", meta.Name))

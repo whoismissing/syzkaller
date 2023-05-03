@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
@@ -38,9 +39,11 @@ import (
 )
 
 var (
-	flagConfig = flag.String("config", "", "configuration file")
-	flagDebug  = flag.Bool("debug", false, "dump all VM output to console")
-	flagBench  = flag.String("bench", "", "write execution statistics into this file periodically")
+	flagConfig    = flag.String("config", "", "configuration file")
+	flagDebug     = flag.Bool("debug", false, "dump all VM output to console")
+	flagBench     = flag.String("bench", "", "write execution statistics into this file periodically")
+	flagAuxiliary = flag.String("auxiliary", "", "auxiliary file helping find crashes")
+	flagSplice    = flag.Bool("splice", true, "splice mutation option")
 )
 
 type Manager struct {
@@ -69,6 +72,9 @@ type Manager struct {
 	phase                 int
 	configEnabledSyscalls []int
 	targetEnabledSyscalls map[*prog.Syscall]bool
+
+	progSeed      []byte
+	spliceEnabled bool
 
 	candidates       []rpctype.RPCCandidate // untriaged inputs from corpus and hub
 	disabledHashes   map[string]struct{}
@@ -187,6 +193,18 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, sysTarget *targets.T
 		log.Fatalf("failed to open corpus database: %v", err)
 	}
 
+	mgr.spliceEnabled = *flagSplice
+
+	if mgr.spliceEnabled {
+		log.Logf(0, "Enable splice and mutation on auxiliary file")
+	}
+
+	// zip : load poc before starting the RPCServer
+	if *flagAuxiliary != "" {
+		log.Logf(0, "loading from auxiliary file")
+		mgr.LoadAuxiliary()
+	}
+
 	// Create HTTP server.
 	mgr.initHTTP()
 	mgr.collectUsedFiles()
@@ -217,13 +235,14 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, sysTarget *targets.T
 			crashes := mgr.stats.crashes.get()
 			corpusCover := mgr.stats.corpusCover.get()
 			corpusSignal := mgr.stats.corpusSignal.get()
+			corpusObjSig := mgr.stats.corpusObjSig.get()
 			maxSignal := mgr.stats.maxSignal.get()
 			mgr.mu.Unlock()
 			numReproducing := atomic.LoadUint32(&mgr.numReproducing)
 			numFuzzing := atomic.LoadUint32(&mgr.numFuzzing)
 
-			log.Logf(0, "VMs %v, executed %v, corpus cover %v, corpus signal %v, max signal %v, crashes %v, repro %v",
-				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing)
+			log.Logf(0, "VMs %v, executed %v, corpus cover %v, corpus signal %v, object signal %v, max signal %v, crashes %v, repro %v",
+				numFuzzing, executed, corpusCover, corpusSignal, corpusObjSig, maxSignal, crashes, numReproducing)
 		}
 	}()
 
@@ -447,6 +466,27 @@ func (mgr *Manager) vmLoop() {
 			goto wait
 		}
 	}
+}
+
+func (mgr *Manager) LoadAuxiliary() error {
+	f, err := os.Open(filepath.Join(mgr.cfg.Workdir, *flagAuxiliary))
+	if err != nil {
+		log.Fatalf("Cannot open %v", *flagAuxiliary)
+		return err
+	}
+	mgr.progSeed, err = ioutil.ReadAll(f)
+	if err != nil {
+		log.Fatalf("Open auxiliary failed\n")
+	}
+	// do not add it as a candidate since the candidate will be executed
+	// when the fuzzer starts, letting the fuzzer crash.
+	// log.Logf(0, "adding\n %v as a candidate", string(mgr.progSeed))
+	// mgr.candidates = append(mgr.candidates, rpctype.RPCCandidate{
+	// 	Prog:      mgr.progSeed,
+	// 	Minimized: true,
+	// 	Smashed:   false, // what does this for?
+	// })
+	return err
 }
 
 func (mgr *Manager) loadCorpus() {
@@ -1034,6 +1074,7 @@ func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*pr
 	for _, feat := range a.Features.Supported() {
 		log.Logf(0, "%-24v: %v", feat.Name, feat.Reason)
 	}
+
 	mgr.checkResult = a
 	mgr.targetEnabledSyscalls = enabledSyscalls
 	mgr.loadCorpus()

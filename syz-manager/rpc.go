@@ -22,15 +22,21 @@ type RPCServer struct {
 	target                *prog.Target
 	configEnabledSyscalls []int
 	targetEnabledSyscalls map[*prog.Syscall]bool
+	spliceEnabled         bool
 	stats                 *Stats
 	sandbox               string
 	batchSize             int
+
+	progSeed []byte
+
+	corpusSyscall map[string]bool
 
 	mu           sync.Mutex
 	fuzzers      map[string]*Fuzzer
 	checkResult  *rpctype.CheckArgs
 	maxSignal    signal.Signal
 	corpusSignal signal.Signal
+	corpusObjSig signal.Signal
 	corpusCover  cover.Cover
 	rotator      *prog.Rotator
 	rnd          *rand.Rand
@@ -62,10 +68,13 @@ func startRPCServer(mgr *Manager) (int, error) {
 		mgr:                   mgr,
 		target:                mgr.target,
 		configEnabledSyscalls: mgr.configEnabledSyscalls,
+		spliceEnabled:         mgr.spliceEnabled,
 		stats:                 mgr.stats,
 		sandbox:               mgr.cfg.Sandbox,
 		fuzzers:               make(map[string]*Fuzzer),
 		rnd:                   rand.New(rand.NewSource(time.Now().UnixNano())),
+		progSeed:              mgr.progSeed,
+		corpusSyscall:         make(map[string]bool),
 	}
 	serv.batchSize = 5
 	if serv.batchSize < mgr.cfg.Procs {
@@ -99,6 +108,8 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	r.EnabledCalls = serv.configEnabledSyscalls
 	r.GitRevision = prog.GitRevision
 	r.TargetRevision = serv.target.Revision
+	r.ProgSeed = serv.progSeed
+	r.SpliceEnabled = serv.spliceEnabled
 	// TODO: temporary disabled b/c we suspect this negatively affects fuzzing.
 	if false && serv.mgr.rotateCorpus() && serv.rnd.Intn(3) != 0 {
 		// We do rotation every other time because there are no objective
@@ -207,10 +218,18 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
 	return nil
 }
 
+func logSignal(signal signal.Signal) {
+	for m := range signal {
+		log.Logf(3, "Signal value: 0xffffffff%x\n", m)
+	}
+}
+
 func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 	inputSignal := a.Signal.Deserialize()
-	log.Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",
-		a.Name, a.Call, inputSignal.Len(), len(a.Cover))
+	inputObjSig := a.ObjSig.Deserialize()
+	log.Logf(0, "new input from %v for syscall %v (signal=%v, object signal=%v, cover=%v)",
+		a.Name, a.Call, inputSignal.Len(), inputObjSig.Len(), len(a.Cover))
+	logSignal(inputObjSig)
 	bad, disabled := checkProgram(serv.target, serv.targetEnabledSyscalls, a.RPCInput.Prog)
 	if bad || disabled {
 		log.Logf(0, "rejecting program from fuzzer (bad=%v, disabled=%v):\n%s", bad, disabled, a.RPCInput.Prog)
@@ -221,14 +240,25 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 
 	f := serv.fuzzers[a.Name]
 	genuine := !serv.corpusSignal.Diff(inputSignal).Empty()
+	newObjSig := serv.corpusObjSig.Diff(inputObjSig)
+	newObj := !newObjSig.Empty()
+	newSyscall := false
+	_, found := serv.corpusSyscall[a.Call]
+	if !found {
+		serv.corpusSyscall[a.Call] = true
+		newSyscall = true
+	}
+	if newObj || newSyscall {
+		log.Logf(0, "received new input from %v with object signal : %v, new : %v", a.Call, inputObjSig.Len(), newObjSig.Len())
+	}
 	rotated := false
-	if !genuine && f.rotatedSignal != nil {
+	if !genuine && !newObj && f.rotatedSignal != nil {
 		rotated = !f.rotatedSignal.Diff(inputSignal).Empty()
 	}
-	if !genuine && !rotated {
+	if !genuine && !newObj && !rotated && !newSyscall {
 		return nil
 	}
-	if !serv.mgr.newInput(a.RPCInput, inputSignal) {
+	if !serv.mgr.newInput(a.RPCInput, inputSignal) && !newSyscall {
 		return nil
 	}
 
@@ -242,9 +272,11 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 		serv.stats.rotatedInputs.inc()
 	}
 
-	if genuine {
+	if genuine || newObj || newSyscall {
 		serv.corpusSignal.Merge(inputSignal)
+		serv.corpusObjSig.Merge(inputObjSig)
 		serv.stats.corpusSignal.set(serv.corpusSignal.Len())
+		serv.stats.corpusObjSig.set(serv.corpusObjSig.Len())
 
 		a.RPCInput.Cover = nil // Don't send coverage back to all fuzzers.
 		for _, other := range serv.fuzzers {
@@ -280,6 +312,7 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 	}
 	r.MaxSignal = f.newMaxSignal.Split(500).Serialize()
 	if a.NeedCandidates {
+		log.Logf(3, "call for candidates from %s\n", a.Name)
 		r.Candidates = serv.mgr.candidateBatch(serv.batchSize)
 	}
 	if len(r.Candidates) == 0 {
@@ -302,7 +335,7 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 			f.inputs = nil
 		}
 	}
-	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v",
+	log.Logf(3, "poll from %v: candidates=%v inputs=%v maxsignal=%v",
 		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems))
 	return nil
 }

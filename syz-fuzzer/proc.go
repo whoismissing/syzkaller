@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -66,16 +67,137 @@ func (proc *Proc) loop() {
 		// because fallback signal is weak.
 		generatePeriod = 2
 	}
+
+	var execMu sync.RWMutex
+
+	// generating progs using the syscalls from the corpus
+	if proc.fuzzer.spliceEnabled {
+		go func() {
+			// let's sleep for 10s waiting for the generation of corpus
+			time.Sleep(10 * time.Second)
+			var lastGen time.Time
+			for {
+				if time.Since(lastGen) > 10*time.Second {
+					lastGen = time.Now()
+					if len(proc.fuzzer.corpusSyscall) < 2 {
+						log.Logf(0, "number of corpusSyscall is less than 2")
+						continue
+					}
+
+					if proc.fuzzer.corpusChoiceTable == nil {
+						log.Logf(0, "No choice table!\n")
+						continue
+					}
+
+					// keep running for 50 iterations
+					for i := 0; i < 50; i++ {
+						log.Logf(3, "Generating new inputs from corpus")
+						proc.fuzzer.ctMu.Lock()
+						ct := proc.fuzzer.corpusChoiceTable
+						p := proc.fuzzer.target.Generate(proc.rnd, prog.RecommendedCalls, ct)
+						log.Logf(3, "Generated:\n%s\n", p.Serialize())
+						proc.fuzzer.ctMu.Unlock()
+						execMu.Lock()
+						proc.execute(proc.execOpts, p, ProgNormal, StatGenerate)
+						execMu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+
 	for i := 0; ; i++ {
 		item := proc.fuzzer.workQueue.dequeue()
 		if item != nil {
 			switch item := item.(type) {
 			case *WorkTriage:
+				execMu.Lock()
 				proc.triageInput(item)
+				execMu.Unlock()
 			case *WorkCandidate:
+				execMu.Lock()
 				proc.execute(proc.execOpts, item.p, item.flags, StatCandidate)
+				execMu.Unlock()
 			case *WorkSmash:
+				execMu.Lock()
 				proc.smashInput(item)
+				execMu.Unlock()
+			case *WorkSeed:
+				if len(item.p.Calls) == 0 {
+					continue
+				}
+
+				proc.fuzzer.enableCorpusSyscall(item.p)
+
+				if proc.fuzzer.spliceEnabled {
+					// keep mutating seed
+					go func(item *WorkSeed) {
+						for {
+							log.Logf(0, "mutating the WorkSeed\n")
+							fuzzerSnapshot := proc.fuzzer.snapshot()
+							// for seed mutation, let's randomly remove some of calls to avoid keeping
+							// crash all the time. the purpose of doing mutation on poc seed is to find
+							// more syscalls that are covering the target object.
+
+							var ncalls int
+							if len(item.p.Calls) < 2 {
+								ncalls = 0
+							} else if len(item.p.Calls) < 4 {
+								ncalls = 1
+							} else {
+								log.Logf(3, "value : %v\n", len(item.p.Calls)/2-1)
+								ncalls = proc.rnd.Intn(len(item.p.Calls)/2-1) + 1
+							}
+
+							log.Logf(1, "before removing, len: %d\n", len(item.p.Calls))
+
+							if len(item.p.Calls) == 0 {
+								panic("Empty WorkSeed!")
+							}
+
+							for i := 0; i < 10; i++ {
+								p := item.p.Clone()
+
+								for i := 0; i < ncalls; i++ {
+									// remove some call to prevent frequent crashes
+									p.RemoveCall(proc.rnd.Intn(len(p.Calls)))
+								}
+
+								p.MutatePoc(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, fuzzerSnapshot.corpus)
+
+								execMu.Lock()
+								log.Logf(3, "#%v: poc mutated: %s\n\n\n", proc.pid, p.Serialize())
+								proc.execute(proc.execOpts, p, ProgNormal, StatFuzz)
+								log.Logf(3, "#%v: poc executed\n", proc.pid)
+								execMu.Unlock()
+							}
+
+							// FIXME: adjust the timeout here
+							time.Sleep(10 * time.Second)
+						}
+					}(item)
+
+					go func(item *WorkSeed) {
+						for {
+							fuzzerSnapshot := proc.fuzzer.snapshot()
+							if len(fuzzerSnapshot.corpus) != 0 {
+								p := fuzzerSnapshot.chooseProgram(proc.rnd).Clone()
+								log.Logf(3, "splicing seed with poc")
+								for i := 0; i < 30; i++ {
+									if p.SplicePoc(proc.rnd, item.p) {
+										execMu.Lock()
+										proc.execute(proc.execOpts, p, ProgNormal, StatGenerate)
+										execMu.Unlock()
+									}
+								}
+							}
+							time.Sleep(5 * time.Second)
+						}
+					}(item)
+				}
+
+				log.Logf(0, "In workseed, sleeping...\n")
+				time.Sleep(2 * time.Second)
 			default:
 				log.Fatalf("unknown work type: %#v", item)
 			}
@@ -86,35 +208,73 @@ func (proc *Proc) loop() {
 		fuzzerSnapshot := proc.fuzzer.snapshot()
 		if len(fuzzerSnapshot.corpus) == 0 || i%generatePeriod == 0 {
 			// Generate a new prog.
+			log.Logf(1, "Generating new inputs\n")
 			p := proc.fuzzer.target.Generate(proc.rnd, prog.RecommendedCalls, ct)
 			log.Logf(1, "#%v: generated", proc.pid)
+			execMu.Lock()
 			proc.execute(proc.execOpts, p, ProgNormal, StatGenerate)
+			execMu.Unlock()
 		} else {
 			// Mutate an existing prog.
 			p := fuzzerSnapshot.chooseProgram(proc.rnd).Clone()
+			log.Logf(3, "using original mutation")
 			p.Mutate(proc.rnd, prog.RecommendedCalls, ct, fuzzerSnapshot.corpus)
 			log.Logf(1, "#%v: mutated", proc.pid)
+			execMu.Lock()
 			proc.execute(proc.execOpts, p, ProgNormal, StatFuzz)
+			execMu.Unlock()
 		}
 	}
 }
 
+// for triaging object input, we want to keep the new covered object signal and minimize
+// the prog.
+// for triaging inputs that have new coverage signal, we want to keep the coverage of object
+// signal when minimizing.
 func (proc *Proc) triageInput(item *WorkTriage) {
-	log.Logf(1, "#%v: triaging type=%x", proc.pid, item.flags)
-
-	prio := signalPrio(item.p, &item.info, item.call)
-	inputSignal := signal.FromRaw(item.info.Signal, prio)
-	newSignal := proc.fuzzer.corpusSignalDiff(inputSignal)
-	if newSignal.Empty() {
-		return
+	log.Logf(0, "#%v: triaging type=%x", proc.pid, item.flags)
+	triageObj := false
+	if item.flags&ProgTriageObj != 0 {
+		triageObj = true
 	}
+
+	callInfo := item.progInfo.Calls[item.call]
+	var inputSignal, newSignal signal.Signal
+
+	if triageObj {
+		inputSignal = proc.fuzzer.getObjSignal(item.p, item.progInfo, item.call)
+		newSignal = proc.fuzzer.corpusObjSignalDiff(inputSignal)
+	} else {
+		prio := signalPrio(item.p, &callInfo, item.call)
+		inputSignal = signal.FromRaw(callInfo.Signal, prio)
+		newSignal = proc.fuzzer.corpusSignalDiff(inputSignal)
+	}
+
+	if newSignal.Empty() {
+		name := item.p.Calls[item.call].Meta.Name
+		_, found := proc.fuzzer.corpusSyscall[name]
+		// return if the syscall has been in the corpusSyscall
+		if found || !triageObj || inputSignal.Empty() {
+			return
+		}
+
+		// keep the obj signal as new signal since this syscall is not in the corpus
+		log.Logf(3, "keep this syscall %v since it is not in corpus\n", name)
+		newSignal = inputSignal
+	}
+
 	callName := ".extra"
 	logCallName := "extra"
-	if item.call != -1 {
+	if item.call >= 0 {
 		callName = item.p.Calls[item.call].Meta.Name
 		logCallName = fmt.Sprintf("call #%v %v", item.call, callName)
 	}
+	if triageObj {
+		callName = item.p.Calls[item.call].Meta.Name
+		logCallName = fmt.Sprintf("call object interaction #%v %v", item.call, callName)
+	}
 	log.Logf(3, "triaging input for %v (new signal=%v)", logCallName, newSignal.Len())
+
 	var inputCover cover.Cover
 	const (
 		signalRuns       = 3
@@ -124,7 +284,11 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	notexecuted := 0
 	for i := 0; i < signalRuns; i++ {
 		info := proc.executeRaw(proc.execOptsCover, item.p, StatTriage)
-		if !reexecutionSuccess(info, &item.info, item.call) {
+
+		var thisCover []uint32
+		var thisSignal signal.Signal
+		// original execution
+		if !reexecutionSuccess(info, &callInfo, item.call) {
 			// The call was not executed or failed.
 			notexecuted++
 			if notexecuted > signalRuns/2+1 {
@@ -132,27 +296,90 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 			}
 			continue
 		}
-		thisSignal, thisCover := getSignalAndCover(item.p, info, item.call)
+		thisSignal, thisCover = getSignalAndCover(item.p, info, item.call)
+
+		if triageObj {
+			// item.call is always greater than 0 for triaging object cov.
+			thisSignal = proc.fuzzer.getObjSignal(item.p, info, item.call)
+		}
+
 		newSignal = newSignal.Intersection(thisSignal)
+
 		// Without !minimized check manager starts losing some considerable amount
 		// of coverage after each restart. Mechanics of this are not completely clear.
 		if newSignal.Empty() && item.flags&ProgMinimized == 0 {
+			log.Logf(3, "No new signal : %v", item.flags&ProgMinimized)
 			return
 		}
 		inputCover.Merge(thisCover)
 	}
+
+	// minimizing prog, while minimizing, we want to keep the cover of object
+	// to make sure the prog in corpus are covering the target object
+	var objInputSignal, newObjSignal signal.Signal
+	if !triageObj {
+		// objInputSignal = proc.fuzzer.getAllObjSignal(item.p, item.progInfo)
+		objInputSignal = proc.fuzzer.getObjSignal(item.p, item.progInfo, item.call)
+		newObjSignal = proc.fuzzer.corpusObjSignalDiff(objInputSignal)
+	} else {
+		objInputSignal = inputSignal
+		newObjSignal = newSignal
+	}
+
+	// return if no obj sig
+	if objInputSignal.Empty() {
+		log.Logf(3, "Empty objInput Signal")
+		return
+	}
+
+	if triageObj {
+		log.Logf(3, "trying minizing prog for new obj cov")
+	} else {
+		log.Logf(3, "trying minizing prog for new sig")
+	}
+
+	// use the new signal and cover of the syscalls after minimzing the prog.
 	if item.flags&ProgMinimized == 0 {
 		item.p, item.call = prog.Minimize(item.p, item.call, false,
 			func(p1 *prog.Prog, call1 int) bool {
 				for i := 0; i < minimizeAttempts; i++ {
-					info := proc.execute(proc.execOptsNoCollide, p1, ProgNormal, StatMinimize)
-					if !reexecutionSuccess(info, &item.info, call1) {
+					// use executeRaw here, since we are not going to triage
+					// the prog we are working on.
+					info := proc.executeRaw(proc.execOptsNoCollide, p1, StatMinimize)
+
+					if !reexecutionSuccess(info, &callInfo, call1) {
 						// The call was not executed or failed.
 						continue
 					}
-					thisSignal, _ := getSignalAndCover(p1, info, call1)
-					if newSignal.Intersection(thisSignal).Len() == newSignal.Len() {
-						return true
+					// thisSignal, _ := getSignalAndCover(p1, info, call1)
+					// if newSignal.Intersection(thisSignal).Len() == newSignal.Len() {
+					// 	return true
+					// }
+
+					thisObjSignal := proc.fuzzer.getObjSignal(p1, info, call1)
+
+					if triageObj {
+						// FIXME: do we need to keep objInputSignal???
+						if newObjSignal.Intersection(thisObjSignal).Len() == newObjSignal.Len() {
+							thisSignal, thisCover := getSignalAndCover(p1, info, call1)
+							var minCov cover.Cover
+							minCov.Merge(thisCover)
+							inputCover = minCov
+							inputSignal = thisSignal
+							return true
+						}
+					} else {
+						thisSignal, thisCover := getSignalAndCover(p1, info, call1)
+						// we want to keep the signal of object when minimizing.
+						if objInputSignal.Intersection(thisObjSignal).Len() == objInputSignal.Len() &&
+							newSignal.Intersection(thisSignal).Len() == newSignal.Len() {
+							// reset input cover and signal after minimizing
+							var minCov cover.Cover
+							minCov.Merge(thisCover)
+							inputCover = minCov
+							inputSignal = thisSignal
+							return true
+						}
 					}
 				}
 				return false
@@ -162,15 +389,16 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	data := item.p.Serialize()
 	sig := hash.Hash(data)
 
-	log.Logf(2, "added new input for %v to corpus:\n%s", logCallName, data)
+	log.Logf(0, "added new input for %v to corpus:\n%s", logCallName, data)
 	proc.fuzzer.sendInputToManager(rpctype.RPCInput{
 		Call:   callName,
 		Prog:   data,
 		Signal: inputSignal.Serialize(),
+		ObjSig: objInputSignal.Serialize(),
 		Cover:  inputCover.Serialize(),
 	})
 
-	proc.fuzzer.addInputToCorpus(item.p, inputSignal, sig)
+	proc.fuzzer.addInputToCorpus(item.p, inputSignal, objInputSignal, sig)
 
 	if item.flags&ProgSmashed == 0 {
 		proc.fuzzer.workQueue.enqueue(&WorkSmash{item.p, item.call})
@@ -211,9 +439,12 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 	for i := 0; i < 100; i++ {
 		p := item.p.Clone()
 		p.Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, fuzzerSnapshot.corpus)
-		log.Logf(1, "#%v: smash mutated", proc.pid)
 		proc.execute(proc.execOpts, p, ProgNormal, StatSmash)
 	}
+}
+
+func (proc *Proc) mutateSeed(item *WorkSeed) {
+
 }
 
 func (proc *Proc) failCall(p *prog.Prog, call int) {
@@ -248,28 +479,67 @@ func (proc *Proc) executeHintSeed(p *prog.Prog, call int) {
 }
 
 func (proc *Proc) execute(execOpts *ipc.ExecOpts, p *prog.Prog, flags ProgTypes, stat Stat) *ipc.ProgInfo {
+	// enable collectcover by default
+	execOpts.Flags |= ipc.FlagCollectCover
 	info := proc.executeRaw(execOpts, p, stat)
-	calls, extra := proc.fuzzer.checkNewSignal(p, info)
-	for _, callIndex := range calls {
-		proc.enqueueCallTriage(p, flags, callIndex, info.Calls[callIndex])
+
+	num := proc.fuzzer.getObjCoverSize(info)
+	if num == 0 {
+		// discard triaging if there is no object covered
+		return info
 	}
-	if extra {
-		proc.enqueueCallTriage(p, flags, -1, info.Extra)
+
+	log.Logf(3, "We got %v objcov", num)
+	// triage every syscall in the prog if new covs are generated
+	// for syscalls covering new object, we use mark it as object triage.
+	objCalls, _ := proc.fuzzer.checkNewObjSignal(p, info)
+
+	for _, objCallIndex := range objCalls {
+		// enqueue obj call triage
+		log.Logf(2, "enqueuing obj call")
+		newFlags := flags | ProgTriageObj
+		proc.enqueueCallTriage(p, newFlags, objCallIndex, info)
 	}
+
+	// calls, _ := proc.fuzzer.checkNewSignal(p, info)
+
+	// for _, callIndex := range calls {
+	// only explore syscalls that have object cover
+	// FIXME: unknow if this has any side-effect
+	for _, callIndex := range objCalls {
+		// skip if no object is covered
+		if len(info.Calls[callIndex].ObjCover) == 0 {
+			continue
+		}
+		log.Logf(2, "enqueuing new signal call")
+		proc.enqueueCallTriage(p, flags, callIndex, info)
+	}
+	// will not cover extra
+	// if extra {
+	// 	proc.enqueueCallTriage(p, flags, -1, info)
+	// }
 	return info
 }
 
-func (proc *Proc) enqueueCallTriage(p *prog.Prog, flags ProgTypes, callIndex int, info ipc.CallInfo) {
-	// info.Signal points to the output shmem region, detach it before queueing.
-	info.Signal = append([]uint32{}, info.Signal...)
-	// None of the caller use Cover, so just nil it instead of detaching.
-	// Note: triage input uses executeRaw to get coverage.
-	info.Cover = nil
+func (proc *Proc) enqueueCallTriage(p *prog.Prog, flags ProgTypes, callIndex int, info *ipc.ProgInfo) {
+	if callIndex > 0 {
+		// info.Signal points to the output shmem region, detach it before queueing.
+		info.Calls[callIndex].Signal = append([]uint32{}, info.Calls[callIndex].Signal...)
+		// None of the caller use Cover, so just nil it instead of detaching.
+		// Note: triage input uses executeRaw to get coverage.
+		info.Calls[callIndex].Cover = nil
+	} else if callIndex == -1 {
+		// info.Signal points to the output shmem region, detach it before queueing.
+		info.Extra.Signal = append([]uint32{}, info.Extra.Signal...)
+		// None of the caller use Cover, so just nil it instead of detaching.
+		// Note: triage input uses executeRaw to get coverage.
+		info.Extra.Cover = nil
+	}
 	proc.fuzzer.workQueue.enqueue(&WorkTriage{
-		p:     p.Clone(),
-		call:  callIndex,
-		info:  info,
-		flags: flags,
+		p:        p.Clone(),
+		call:     callIndex,
+		progInfo: info,
+		flags:    flags,
 	})
 }
 
@@ -280,6 +550,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 	for _, call := range p.Calls {
 		if !proc.fuzzer.choiceTable.Enabled(call.Meta.ID) {
 			fmt.Printf("executing disabled syscall %v", call.Meta.Name)
+			// TODO: enable syscalls in poc
 			panic("disabled syscall")
 		}
 	}

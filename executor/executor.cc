@@ -881,7 +881,7 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 	// Truncate PCs to uint32 assuming that they fit into 32-bits.
 	// True for x86_64 and arm64 without KASLR.
 	for (uint32 i = 0; i < cover_size; i++)
-		write_output(cover_data[i]);
+		write_output_64(cover_data[i]);
 	*cover_count_pos = cover_size;
 }
 #endif

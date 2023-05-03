@@ -40,6 +40,7 @@ type Fuzzer struct {
 	workQueue         *WorkQueue
 	needPoll          chan struct{}
 	choiceTable       *prog.ChoiceTable
+	corpusChoiceTable *prog.ChoiceTable
 	stats             [StatCount]uint64
 	manager           *rpctype.RPCClient
 	target            *prog.Target
@@ -47,8 +48,10 @@ type Fuzzer struct {
 
 	faultInjectionEnabled    bool
 	comparisonTracingEnabled bool
+	spliceEnabled            bool
 
 	corpusMu     sync.RWMutex
+	ctMu         sync.RWMutex
 	corpus       []*prog.Prog
 	corpusHashes map[hash.Sig]struct{}
 	corpusPrios  []int64
@@ -58,6 +61,11 @@ type Fuzzer struct {
 	corpusSignal signal.Signal // signal of inputs in corpus
 	maxSignal    signal.Signal // max signal ever observed including flakes
 	newSignal    signal.Signal // diff of maxSignal since last sync with master
+
+	corpusObjSignal signal.Signal
+	maxObjSignal    signal.Signal
+	newObjSignal    signal.Signal
+	corpusSyscall   map[string]bool
 
 	logMu sync.Mutex
 }
@@ -221,6 +229,12 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+
+	// zip new data from manager
+	if len(r.ProgSeed) > 0 {
+		log.Logf(0, "Received seed prog\n")
+	}
+
 	log.Logf(0, "syscalls: %v", len(r.CheckResult.EnabledCalls[sandbox]))
 	for _, feat := range r.CheckResult.Features.Supported() {
 		log.Logf(0, "%v: %v", feat.Name, feat.Reason)
@@ -246,6 +260,8 @@ func main() {
 		faultInjectionEnabled:    r.CheckResult.Features[host.FeatureFault].Enabled,
 		comparisonTracingEnabled: r.CheckResult.Features[host.FeatureComparisons].Enabled,
 		corpusHashes:             make(map[hash.Sig]struct{}),
+		spliceEnabled:            r.SpliceEnabled,
+		corpusSyscall:            make(map[string]bool),
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
@@ -256,6 +272,22 @@ func main() {
 	for _, id := range r.CheckResult.EnabledCalls[sandbox] {
 		calls[target.Syscalls[id]] = true
 	}
+
+	p := fuzzer.deserializeInput(r.ProgSeed)
+	if p == nil {
+		log.Logf(0, "Failed to deserialize the seed poc")
+	} else {
+		fuzzer.workQueue.enqueue(&WorkSeed{
+			p: p,
+		})
+		log.Logf(0, "Added seed prog\n")
+
+		// make sure the syscalls in the poc are enabled
+		for _, c := range p.Calls {
+			calls[c.Meta] = true
+		}
+	}
+
 	fuzzer.choiceTable = target.BuildChoiceTable(fuzzer.corpus, calls)
 
 	for pid := 0; pid < *flagProcs; pid++ {
@@ -333,6 +365,7 @@ func (fuzzer *Fuzzer) pollLoop() {
 		if fuzzer.outputType != OutputStdout && time.Since(lastPrint) > 10*time.Second {
 			// Keep-alive for manager.
 			log.Logf(0, "alive, executed %v", execTotal)
+			log.Logf(0, "size of corpus %v, size of corpusSyscall", len(fuzzer.corpus), len(fuzzer.corpusSyscall))
 			lastPrint = time.Now()
 		}
 		if poll || time.Since(lastPoll) > 10*time.Second {
@@ -369,7 +402,7 @@ func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 		log.Fatalf("Manager.Poll call failed: %v", err)
 	}
 	maxSignal := r.MaxSignal.Deserialize()
-	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v",
+	log.Logf(0, "poll: candidates=%v inputs=%v signal=%v",
 		len(r.Candidates), len(r.NewInputs), maxSignal.Len())
 	fuzzer.addMaxSignal(maxSignal)
 	for _, inp := range r.NewInputs {
@@ -395,13 +428,18 @@ func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.RPCInput) {
 }
 
 func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.RPCInput) {
+	// FIXME: add lock here
+	// sync the corpus syscall among the fuzzers
+	fuzzer.corpusSyscall[inp.Call] = true
+
 	p := fuzzer.deserializeInput(inp.Prog)
 	if p == nil {
 		return
 	}
 	sig := hash.Hash(inp.Prog)
 	sign := inp.Signal.Deserialize()
-	fuzzer.addInputToCorpus(p, sign, sig)
+	objSig := inp.ObjSig.Deserialize()
+	fuzzer.addInputToCorpus(p, sign, objSig, sig)
 }
 
 func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.RPCCandidate) {
@@ -425,6 +463,13 @@ func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.RPCCandidate) {
 func (fuzzer *Fuzzer) deserializeInput(inp []byte) *prog.Prog {
 	p, err := fuzzer.target.Deserialize(inp, prog.NonStrict)
 	if err != nil {
+		ents := fuzzer.target.ParseLog(inp)
+		for _, ee := range ents {
+			p = ee.P
+		}
+	}
+
+	if p == nil {
 		log.Fatalf("failed to deserialize prog: %v\n%s", err, inp)
 	}
 	if len(p.Calls) > prog.MaxCalls {
@@ -441,7 +486,13 @@ func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog {
 	return fuzzer.corpus[idx]
 }
 
-func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig hash.Sig) {
+func (fuzzer *Fuzzer) enableCorpusSyscall(p *prog.Prog) {
+	for _, call := range p.Calls {
+		fuzzer.corpusSyscall[call.Meta.Name] = true
+	}
+}
+
+func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, objSig signal.Signal, sig hash.Sig) {
 	fuzzer.corpusMu.Lock()
 	if _, ok := fuzzer.corpusHashes[sig]; !ok {
 		fuzzer.corpus = append(fuzzer.corpus, p)
@@ -452,13 +503,24 @@ func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig has
 		}
 		fuzzer.sumPrios += prio
 		fuzzer.corpusPrios = append(fuzzer.corpusPrios, fuzzer.sumPrios)
+
+		fuzzer.enableCorpusSyscall(p)
+
+		fuzzer.corpusMu.Unlock()
+		tmpCorpus := fuzzer.snapshot().corpus
+		fuzzer.corpusMu.Lock()
+		if len(fuzzer.corpusSyscall) > 1 && len(tmpCorpus) > 0 {
+			fuzzer.corpusChoiceTable = fuzzer.target.BuildCorpusChoiceTable(tmpCorpus, fuzzer.corpusSyscall)
+		}
 	}
 	fuzzer.corpusMu.Unlock()
 
-	if !sign.Empty() {
+	if !sign.Empty() || !objSig.Empty() {
 		fuzzer.signalMu.Lock()
 		fuzzer.corpusSignal.Merge(sign)
+		fuzzer.corpusObjSignal.Merge(objSig)
 		fuzzer.maxSignal.Merge(sign)
+		fuzzer.maxObjSignal.Merge(objSig)
 		fuzzer.signalMu.Unlock()
 	}
 }
@@ -495,6 +557,12 @@ func (fuzzer *Fuzzer) corpusSignalDiff(sign signal.Signal) signal.Signal {
 	return fuzzer.corpusSignal.Diff(sign)
 }
 
+func (fuzzer *Fuzzer) corpusObjSignalDiff(sign signal.Signal) signal.Signal {
+	fuzzer.signalMu.RLock()
+	defer fuzzer.signalMu.RUnlock()
+	return fuzzer.corpusObjSignal.Diff(sign)
+}
+
 func (fuzzer *Fuzzer) checkNewSignal(p *prog.Prog, info *ipc.ProgInfo) (calls []int, extra bool) {
 	fuzzer.signalMu.RLock()
 	defer fuzzer.signalMu.RUnlock()
@@ -507,8 +575,69 @@ func (fuzzer *Fuzzer) checkNewSignal(p *prog.Prog, info *ipc.ProgInfo) (calls []
 	return
 }
 
+func (fuzzer *Fuzzer) getObjSignal(p *prog.Prog, info *ipc.ProgInfo, call int) signal.Signal {
+	inf := &info.Calls[call]
+	prio := signalPrio(p, inf, call)
+	return signal.ObjCovFromRaw(inf.ObjCover, prio)
+}
+
+func (fuzzer *Fuzzer) getAllObjSignal(p *prog.Prog, info *ipc.ProgInfo) signal.Signal {
+	var prio uint8
+	var objSig signal.Signal
+	for i := range info.Calls {
+		prio = signalPrio(p, &info.Calls[i], i)
+		objSig.Merge(signal.ObjCovFromRaw(info.Calls[i].ObjCover, prio))
+	}
+	return objSig
+}
+
+func (fuzzer *Fuzzer) checkNewObjSignal(p *prog.Prog, info *ipc.ProgInfo) (calls []int, extra bool) {
+	fuzzer.signalMu.RLock()
+	defer fuzzer.signalMu.RUnlock()
+	// objSig := fuzzer.getObjSignal(p, info)
+
+	// newObjSig := fuzzer.maxObjSignal.Diff(objSig)
+	// if newObjSig.Empty() {
+	// 	return false
+	// }
+
+	for i, inf := range info.Calls {
+		if fuzzer.checkNewObjCallSignal(p, &inf, i) {
+			calls = append(calls, i)
+		}
+	}
+	// extra = fuzzer.checkNewObjCallSignal(p, &inf, i)
+	extra = false
+	return
+}
+
+func (fuzzer *Fuzzer) getObjCoverSize(info *ipc.ProgInfo) int {
+	size := 0
+	for i := range info.Calls {
+		size += len(info.Calls[i].ObjCover)
+	}
+	return size
+}
+
 func (fuzzer *Fuzzer) checkNewCallSignal(p *prog.Prog, info *ipc.CallInfo, call int) bool {
 	diff := fuzzer.maxSignal.DiffRaw(info.Signal, signalPrio(p, info, call))
+	if diff.Empty() {
+		return false
+	}
+	fuzzer.signalMu.RUnlock()
+	fuzzer.signalMu.Lock()
+	fuzzer.maxSignal.Merge(diff)
+	fuzzer.newSignal.Merge(diff)
+	fuzzer.signalMu.Unlock()
+	fuzzer.signalMu.RLock()
+	return true
+}
+
+func (fuzzer *Fuzzer) checkNewObjCallSignal(p *prog.Prog, info *ipc.CallInfo, call int) bool {
+	// diff := fuzzer.maxSignal.DiffRaw(info.Signal, signalPrio(p, info, call))
+	objSig := signal.ObjCovFromRaw(info.ObjCover, signalPrio(p, info, call))
+	diff := fuzzer.maxObjSignal.Diff(objSig)
+
 	if diff.Empty() {
 		return false
 	}

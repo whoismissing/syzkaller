@@ -62,6 +62,27 @@ func FromRaw(raw []uint32, prio uint8) Signal {
 	return s
 }
 
+func ObjCovFromRaw(raw []uint32, prio uint8) Signal {
+	if len(raw) == 0 {
+		return nil
+	}
+	s := make(Signal, len(raw))
+	for _, e := range raw {
+		if val, ok := s[elemType(e)]; ok {
+			// higher signal value when the same object address
+			// is covered. we use 5th bit to 7th from the last since it's
+			// unused in signalPrio, signalPrio uses the last and
+			// second from the last.
+			if (val >> 4) < 0x4 { // 4 is the max value
+				s[elemType(e)] = prioType(val + (1<<4))
+			}
+		} else {
+			s[elemType(e)] = prioType(prio)
+		}
+	}
+	return s
+}
+
 func (s Signal) Serialize() Serial {
 	if s.Empty() {
 		return Serial{}

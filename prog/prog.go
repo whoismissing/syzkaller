@@ -5,6 +5,8 @@ package prog
 
 import (
 	"fmt"
+
+	"github.com/google/syzkaller/pkg/log"
 )
 
 type Prog struct {
@@ -319,8 +321,31 @@ func (p *Prog) insertBefore(c *Call, calls []*Call) {
 	p.Calls = newCalls
 }
 
+func (p *Prog) insertAfter(c *Call, calls []*Call) {
+	idx := 0
+	for ; idx < len(p.Calls); idx++ {
+		if p.Calls[idx] == c {
+			break
+		}
+	}
+
+	idx += 1
+	if idx > len(p.Calls) {
+		idx = len(p.Calls)
+	}
+	var newCalls []*Call
+	newCalls = append(newCalls, p.Calls[:idx]...)
+	newCalls = append(newCalls, calls...)
+	if idx < len(p.Calls) {
+		newCalls = append(newCalls, p.Calls[idx])
+		newCalls = append(newCalls, p.Calls[idx+1:]...)
+	}
+	p.Calls = newCalls
+}
+
 // replaceArg replaces arg with arg1 in a program.
 func replaceArg(arg, arg1 Arg) {
+	log.Logf(3, "In replaceArg: replacing %s with %s\n", arg, arg1)
 	switch a := arg.(type) {
 	case *ConstArg:
 		*a = *arg1.(*ConstArg)
@@ -334,12 +359,16 @@ func replaceArg(arg, arg1 Arg) {
 		*a = *arg1.(*DataArg)
 	case *GroupArg:
 		a1 := arg1.(*GroupArg)
-		if len(a.Inner) != len(a1.Inner) {
-			panic(fmt.Sprintf("replaceArg: group fields don't match: %v/%v",
-				len(a.Inner), len(a1.Inner)))
+		size := len(a.Inner)
+		if len(a.Inner) > len(a1.Inner) {
+			// panic(fmt.Sprintf("replaceArg: group fields don't match: %v/%v",
+			// 	len(a.Inner), len(a1.Inner)))
+			fmt.Sprintf("replaceArg: group fields don't match: %v/%v",
+				len(a.Inner), len(a1.Inner))
+			size = len(a1.Inner)
 		}
 		a.ArgCommon = a1.ArgCommon
-		for i := range a.Inner {
+		for i := 0; i < size; i++ {
 			replaceArg(a.Inner[i], a1.Inner[i])
 		}
 	default:
@@ -396,6 +425,16 @@ func (p *Prog) removeCall(idx int) {
 	}
 	copy(p.Calls[idx:], p.Calls[idx+1:])
 	p.Calls = p.Calls[:len(p.Calls)-1]
+}
+
+func (p *Prog) removeCallc(c *Call) {
+	idx := 0
+	for ; idx < len(p.Calls)-1; idx++ {
+		if p.Calls[idx] == c {
+			break
+		}
+	}
+	p.removeCall(idx)
 }
 
 func (p *Prog) sanitizeFix() {

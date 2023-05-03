@@ -86,9 +86,10 @@ const (
 )
 
 type CallInfo struct {
-	Flags  CallFlags
-	Signal []uint32 // feedback signal, filled if FlagSignal is set
-	Cover  []uint32 // per-call coverage, filled if FlagSignal is set and cover == true,
+	Flags    CallFlags
+	Signal   []uint32 // feedback signal, filled if FlagSignal is set
+	Cover    []uint32 // per-call coverage, filled if FlagSignal is set and cover == true,
+	ObjCover []uint32
 	// if dedup == false, then cov effectively contains a trace, otherwise duplicates are removed
 	Comps prog.CompMap // per-call comparison operands
 	Errno int          // call errno (0 if the call was successful)
@@ -356,10 +357,28 @@ func (env *Env) parseOutput(p *prog.Prog) (*ProgInfo, error) {
 			return nil, fmt.Errorf("call %v/%v/%v: signal overflow: %v/%v",
 				i, reply.index, reply.num, reply.signalSize, len(out))
 		}
-		if inf.Cover, ok = readUint32Array(&out, reply.coverSize); !ok {
+		// if inf.Cover, ok = readUint32Array(&out, reply.coverSize); !ok {
+		// 	return nil, fmt.Errorf("call %v/%v/%v: cover overflow: %v/%v",
+		// 		i, reply.index, reply.num, reply.coverSize, len(out))
+		// }
+		// use 64 bit address information
+		var Cover []uint64
+		if Cover, ok = readUint64Array(&out, reply.coverSize); !ok {
 			return nil, fmt.Errorf("call %v/%v/%v: cover overflow: %v/%v",
 				i, reply.index, reply.num, reply.coverSize, len(out))
 		}
+
+		inf.ObjCover = make([]uint32, 0)
+		inf.Cover = make([]uint32, 0)
+		for _, pc := range Cover {
+			// if pc>>32 == 0xdeadbeef {
+			if pc>>32 != 0xffffffff {
+				inf.ObjCover = append(inf.ObjCover, (uint32)(pc&0xffffffff))
+			} else {
+				inf.Cover = append(inf.Cover, (uint32)(pc&0xffffffff))
+			}
+		}
+
 		comps, err := readComps(&out, reply.compsSize)
 		if err != nil {
 			return nil, err
@@ -469,6 +488,24 @@ func readUint32Array(outp *[]byte, size uint32) ([]uint32, bool) {
 	}
 	res := *(*[]uint32)(unsafe.Pointer(&hdr))
 	*outp = out[size*4:]
+	return res, true
+}
+
+func readUint64Array(outp *[]byte, size uint32) ([]uint64, bool) {
+	if size == 0 {
+		return nil, true
+	}
+	out := *outp
+	if int(size)*8 > len(out) {
+		return nil, false
+	}
+	hdr := reflect.SliceHeader{
+		Data: uintptr(unsafe.Pointer(&out[0])),
+		Len:  int(size),
+		Cap:  int(size),
+	}
+	res := *(*[]uint64)(unsafe.Pointer(&hdr))
+	*outp = out[size*8:]
 	return res, true
 }
 

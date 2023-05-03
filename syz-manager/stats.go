@@ -26,6 +26,7 @@ type Stats struct {
 	hubRecvRepro     Stat
 	hubRecvReproDrop Stat
 	corpusCover      Stat
+	corpusObjSig     Stat
 	corpusSignal     Stat
 	maxSignal        Stat
 
