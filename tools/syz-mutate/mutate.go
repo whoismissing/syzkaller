@@ -74,12 +74,54 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to read prog file: %v\n", err)
 			os.Exit(1)
 		}
-		p, err = target.Deserialize(data, prog.Strict)
+		p, err = target.Deserialize(data, prog.NonStrict)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to deserialize the program: %v\n", err)
 			os.Exit(1)
 		}
-		p.Mutate(rs, *flagLen, ct, corpus)
+
+		for _, c := range p.Calls {
+			fmt.Printf("in syscall %s:\n", c.Meta.Name)
+			prog.ForeachArg(c, func(arg prog.Arg, ctx *prog.ArgCtx) {
+				fmt.Printf("%s : %s\n", arg.Type().String(), arg.Type().Name())
+				fmt.Printf("Temple name: %s\n", arg.Type().TemplateName())
+				fmt.Printf("Type: %T\n", arg)
+				fmt.Printf("Type2: %T\n", arg.Type())
+				switch a := arg.Type().(type) {
+				case *prog.StructType:
+					for _, f := range a.Fields {
+						fmt.Printf("In structure: type: %T, name: %s, string: %s\n", f.Type, f.Type.Name(), f.Type.String())
+						switch a := f.Type.(type) {
+						case *prog.BufferType:
+							switch a.Kind {
+							case prog.BufferString:
+								fmt.Printf("Value: %v\n", a.Values)
+
+								// case prog.FlagsType:
+								// 	fmt.Printf("Value: %v\n", a.Values)
+							}
+						}
+					}
+
+				case *prog.BufferType:
+					fmt.Printf("For each: Value: %v\n", a.Values)
+
+				case *prog.FlagsType:
+				case *prog.IntType:
+					fmt.Printf("FlagsType value: %v\n", arg.(*prog.ConstArg).Val)
+				}
+
+				fmt.Printf("\n")
+			})
+		}
+
+		// p_raw := p.Clone()
+		// fmt.Printf("Before mutating:\n%s\n", p.Serialize())
+		// p.MutatePoc(rs, *flagLen, ct, corpus)
+		// fmt.Printf("After mutating poc:\n%s\n", p.Serialize())
+		// p_raw.Mutate(rs, *flagLen, ct, corpus)
+		// fmt.Printf("original mutation:\n%s\n", p_raw.Serialize())
+
 	}
-	fmt.Printf("%s\n", p.Serialize())
+	// fmt.Printf("%s\n", p.Serialize())
 }
