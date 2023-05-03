@@ -42,6 +42,7 @@
 
 #include <errno.h>
 #include <dirent.h>
+#include <limits>
 
 #include "table.h"
 
