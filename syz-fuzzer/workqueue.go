@@ -5,6 +5,7 @@ package main
 
 import (
 	"sync"
+	"time"
 
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/prog"
@@ -20,6 +21,7 @@ type WorkQueue struct {
 	candidate       []*WorkCandidate
 	triage          []*WorkTriage
 	smash           []*WorkSmash
+	grow            []*WorkGrow
 
 	procs          int
 	needCandidates chan struct{}
@@ -61,6 +63,11 @@ type WorkSmash struct {
 	call int
 }
 
+type WorkGrow struct {
+	p     *prog.Prog
+	flags ProgTypes
+}
+
 func newWorkQueue(procs int, needCandidates chan struct{}) *WorkQueue {
 	return &WorkQueue{
 		procs:          procs,
@@ -71,6 +78,7 @@ func newWorkQueue(procs int, needCandidates chan struct{}) *WorkQueue {
 func (wq *WorkQueue) enqueue(item interface{}) {
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
+	lastEnqueue = time.Now()
 	switch item := item.(type) {
 	case *WorkTriage:
 		if item.flags&ProgCandidate != 0 {
@@ -82,6 +90,8 @@ func (wq *WorkQueue) enqueue(item interface{}) {
 		wq.candidate = append(wq.candidate, item)
 	case *WorkSmash:
 		wq.smash = append(wq.smash, item)
+	case *WorkGrow:
+		wq.grow = append(wq.grow, item)
 	default:
 		panic("unknown work type")
 	}
@@ -89,7 +99,7 @@ func (wq *WorkQueue) enqueue(item interface{}) {
 
 func (wq *WorkQueue) dequeue() (item interface{}) {
 	wq.mu.RLock()
-	if len(wq.triageCandidate)+len(wq.candidate)+len(wq.triage)+len(wq.smash) == 0 {
+	if len(wq.triageCandidate)+len(wq.candidate)+len(wq.triage)+len(wq.smash)+len(wq.grow) == 0 {
 		wq.mu.RUnlock()
 		return nil
 	}
@@ -113,6 +123,10 @@ func (wq *WorkQueue) dequeue() (item interface{}) {
 		last := len(wq.smash) - 1
 		item = wq.smash[last]
 		wq.smash = wq.smash[:last]
+	} else if len(wq.grow) != 0 {
+		last := len(wq.grow) - 1
+		item = wq.grow[last]
+		wq.grow = wq.grow[:last]
 	}
 	wq.mu.Unlock()
 	if wantCandidates {

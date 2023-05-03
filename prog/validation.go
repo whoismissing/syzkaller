@@ -95,6 +95,24 @@ func (ctx *validCtx) validateArg(arg Arg, typ Type) error {
 		return fmt.Errorf("bad arg type %#v, expect %#v", arg.Type(), typ)
 	}
 	ctx.args[arg] = true
+	switch arg.(type) {
+	case *ConstArg:
+		LastArg = arg.Type().Name()
+		break
+	case *ResultArg:
+		LastArg = arg.Type().Name()
+		break
+	case *PointerArg:
+		LastArg = arg.Type().Name()
+		break
+	case *DataArg:
+		LastArg = arg.Type().Name()
+		break
+	case *GroupArg:
+		LastGroupArg = arg.Type().Name()
+		break
+	default:
+	}
 	return arg.validate(ctx)
 }
 
@@ -206,6 +224,7 @@ func (arg *GroupArg) validate(ctx *validCtx) error {
 	default:
 		return fmt.Errorf("group arg %v has bad type %v", arg, typ.Name())
 	}
+	LastGroupArg = ""
 	return nil
 }
 

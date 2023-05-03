@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
@@ -162,7 +163,7 @@ const (
 // Exit says which exit modes should be considered as errors/OK.
 // Returns a non-symbolized crash report, or nil if no error happens.
 func (inst *Instance) MonitorExecution(outc <-chan []byte, errc <-chan error,
-	reporter report.Reporter, exit ExitCondition) (rep *report.Report) {
+	reporter report.Reporter, exit ExitCondition, managerStart time.Time, timeLimit int) (rep *report.Report) {
 	mon := &monitor{
 		inst:     inst,
 		outc:     outc,
@@ -233,6 +234,10 @@ func (inst *Instance) MonitorExecution(outc <-chan []byte, errc <-chan error,
 			if mon.matchPos < 0 {
 				mon.matchPos = 0
 			}
+			if timeLimit >= 0 && time.Since(managerStart) >= time.Duration(timeLimit)*time.Hour {
+				log.Logf(0, "running for %d hours, exit now.", timeLimit)
+				return nil
+			}
 		case <-ticker.C:
 			// Detect both "not output whatsoever" and "kernel episodically prints
 			// something to console, but fuzzer is not actually executing programs".
@@ -257,7 +262,7 @@ func (inst *Instance) MonitorExecution(outc <-chan []byte, errc <-chan error,
 				mon.waitForOutput()
 			}
 			rep := &report.Report{
-				Title:      noOutputCrash,
+				Title:      NoOutputCrash,
 				Output:     mon.output,
 				Suppressed: report.IsSuppressed(mon.reporter, mon.output),
 			}
@@ -353,7 +358,7 @@ const (
 	maxErrorLength = 256
 
 	lostConnectionCrash  = "lost connection to test machine"
-	noOutputCrash        = "no output from test machine"
+	NoOutputCrash        = "no output from test machine"
 	timeoutCrash         = "timed out"
 	executingProgramStr1 = "executing program"  // syz-fuzzer output
 	executingProgramStr2 = "executed programs:" // syz-execprog output

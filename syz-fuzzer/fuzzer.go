@@ -102,6 +102,8 @@ const (
 	OutputFile
 )
 
+var lastEnqueue time.Time
+
 func main() {
 	debug.SetGCPercent(50)
 
@@ -115,6 +117,7 @@ func main() {
 		flagPprof   = flag.String("pprof", "", "address to serve pprof profiles")
 		flagTest    = flag.Bool("test", false, "enable image testing mode")      // used by syz-ci
 		flagRunTest = flag.Bool("runtest", false, "enable program testing mode") // used by pkg/runtest
+		flagPoC     = flag.Bool("poc", false, "mutate base on current PoC")
 	)
 	flag.Parse()
 	outputType := parseOutputType(*flagOutput)
@@ -247,6 +250,7 @@ func main() {
 	for _, id := range r.CheckResult.EnabledCalls[sandbox] {
 		calls[target.Syscalls[id]] = true
 	}
+	go fuzzer.sendCallsToManager(r.CheckResult.EnabledCalls, sandbox)
 	prios := target.CalculatePriorities(fuzzer.corpus)
 	fuzzer.choiceTable = target.BuildChoiceTable(prios, calls)
 
@@ -259,6 +263,13 @@ func main() {
 		go proc.loop()
 	}
 
+	MutatingLoop, err1 := newProc(fuzzer, *flagProcs)
+	if err1 != nil {
+		log.Fatalf("failed to create proc: %v", err)
+	}
+	fuzzer.procs = append(fuzzer.procs, MutatingLoop)
+	go MutatingLoop.checkMutatingQueueLoop()
+	prog.ExecutePoCOnly = *flagPoC
 	fuzzer.pollLoop()
 }
 
@@ -315,6 +326,7 @@ func (fuzzer *Fuzzer) pollLoop() {
 	var lastPoll time.Time
 	var lastPrint time.Time
 	ticker := time.NewTicker(3 * time.Second).C
+	lastEnqueue = time.Now()
 	for {
 		poll := false
 		select {
@@ -326,6 +338,11 @@ func (fuzzer *Fuzzer) pollLoop() {
 			// Keep-alive for manager.
 			log.Logf(0, "alive, executed %v", execTotal)
 			lastPrint = time.Now()
+		}
+		if time.Since(lastEnqueue) > 4*time.Minute && time.Since(lastEnqueue) < 5*time.Minute && prog.ExecutePoCOnly && len(fuzzer.workQueue.triageCandidate)+len(fuzzer.workQueue.candidate)+len(fuzzer.workQueue.triage)+len(fuzzer.workQueue.smash)+len(fuzzer.workQueue.grow) == 0 {
+			//log.Logf(0, "set fuzzer free")
+			//fuzzer.sendSignal("set fuzzer free")
+			//prog.ExecutePoCOnly = false
 		}
 		if poll || time.Since(lastPoll) > 10*time.Second {
 			needCandidates := fuzzer.workQueue.wantCandidates()
@@ -367,9 +384,11 @@ func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 	for _, inp := range r.NewInputs {
 		fuzzer.addInputFromAnotherFuzzer(inp)
 	}
+	//if !prog.ExecutePoCOnly {
 	for _, candidate := range r.Candidates {
 		fuzzer.addCandidateInput(candidate)
 	}
+	//}
 	if needCandidates && len(r.Candidates) == 0 && atomic.LoadUint32(&fuzzer.triagedCandidates) == 0 {
 		atomic.StoreUint32(&fuzzer.triagedCandidates, 1)
 	}
@@ -539,5 +558,25 @@ func parseOutputType(str string) OutputType {
 	default:
 		log.Fatalf("-output flag must be one of none/stdout/dmesg/file")
 		return OutputNone
+	}
+}
+
+func (fuzzer *Fuzzer) sendSignal(sg string) {
+	a := &rpctype.FuzzerSignal{
+		Signal: sg,
+	}
+	r := &rpctype.FuzzerSignal{}
+	if err := fuzzer.manager.Call("Manager.EmitSignal", a, r); err != nil {
+		log.Fatalf("emitSignal: failed to connect to manager: %v ", err)
+	}
+}
+
+func (fuzzer *Fuzzer) sendCallsToManager(enabledCalls map[string][]int, sandbox string) {
+	a := &rpctype.GetCallsFromFuzzerArgs{
+		EnabledCalls: enabledCalls,
+		Sandbox:      sandbox,
+	}
+	if err := fuzzer.manager.Call("Manager.GetCallsFromFuzzer", a, nil); err != nil {
+		log.Fatalf("Manager.GetCallsFromFuzzer call failed: %v", err)
 	}
 }

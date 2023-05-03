@@ -34,19 +34,24 @@ func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Pro
 		corpus: corpus,
 	}
 	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {
+		if len(p.Calls) == NOfCalls {
+			ctx.insertCallAtEnd()
+		}
 		switch {
 		case r.oneOf(5):
 			// Not all calls have anything squashable,
 			// so this has lower priority in reality.
-			ok = ctx.squashAny()
+			ok = ctx.squashAnyCus()
 		case r.nOutOf(1, 100):
-			ok = ctx.splice()
+			ok = ctx.spliceCus()
 		case r.nOutOf(20, 31):
-			ok = ctx.insertCall()
+			ok = ctx.insertCallCus()
 		case r.nOutOf(10, 11):
-			ok = ctx.mutateArg()
+			ok = ctx.mutateArgCus()
 		default:
-			ok = ctx.removeCall()
+			if len(p.Calls) > NOfCalls {
+				ok = ctx.removeCallCus()
+			}
 		}
 	}
 	for _, c := range p.Calls {

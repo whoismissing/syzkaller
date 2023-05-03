@@ -183,7 +183,8 @@ func checkMachine(args *checkArgs) (*rpctype.CheckArgs, error) {
 }
 
 func checkRevisions(args *checkArgs) error {
-	log.Logf(0, "checking revisions...")
+	//log.Logf(0, "checking revisions!...")
+	log.Logf(0, "checkRevisions prog.GitRevision %v", prog.GitRevision)
 	executorArgs := strings.Split(args.ipcConfig.Executor, " ")
 	executorArgs = append(executorArgs, "version")
 	cmd := osutil.Command(executorArgs[0], executorArgs[1:]...)

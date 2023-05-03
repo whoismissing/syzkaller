@@ -6,10 +6,13 @@ package prog
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/google/syzkaller/pkg/log"
 )
 
 // String generates a very compact program description (mostly for debug output).
@@ -52,6 +55,256 @@ type serializer struct {
 	vars    map[*ResultArg]int
 	varSeq  int
 	verbose bool
+}
+
+func (target *Target) ReadAddr(data []byte, pIndex *int) uint64 {
+	addr := target.ReadQWord(data, pIndex)
+	*pIndex -= 8
+	return addr
+}
+
+func (target *Target) ReadQWord(data []byte, pIndex *int) uint64 {
+	res := target.ReadData(data, 8, pIndex)
+	num := binary.LittleEndian.Uint64(res)
+	return num
+}
+
+func (target *Target) ReadData(data []byte, size uint64, pIndex *int) []byte {
+	//log.Logf(0, "readData pos: %d size: %d len: %d\n", *pIndex, size, len(data))
+	size_with_margin := (int(size) + 7) / 8 * 8
+	res := data[*pIndex : *pIndex+size_with_margin]
+	*pIndex += size_with_margin
+	return res
+}
+
+/*
+func (target *Target) Do(deep *int, doWhat int, num1 *uint64, num2 *uint64, arg *Arg, data interface{}) {
+	var pInfo *[]PointerInfo
+	var indexOfArgs uint64
+	var indexOfCurrentArgs uint64
+	var addr *uint64
+	var is_pointer uint64
+	var res ResData
+	var ok bool
+	//log.Logf(0, "Enter Do deep: %d doWhat: %d num1: %x num2: %x\n", *deep, doWhat, *num1, *num2)
+	if doWhat == MakePInfo {
+		pInfo, ok = data.(*[]PointerInfo)
+		if !ok {
+			return
+		}
+		indexOfArgs = *num1
+		indexOfCurrentArgs = *num2
+		(*pInfo)[*deep].IndexOfArgs = int(indexOfArgs)
+	}
+	if doWhat == UpdateProg {
+		res, ok = data.(ResData)
+		if !ok {
+			return
+		}
+		addr = num1
+		is_pointer = *num2
+	}
+	switch (*arg).(type) {
+	case *ConstArg:
+		if doWhat == UpdateProg {
+			if is_pointer != 0 {
+				if v, ok := res.ResPointer[*addr]; ok {
+					//log.Logf(0, "ConstArg addr: %x val: %#v\n", addr, v)
+					val := binary.LittleEndian.Uint64(v)
+					(*arg).(*ConstArg).Val = val
+				}
+				//log.Logf(0, "ConstArg addr: %x val: %x size: %v\n", *addr, (*arg).(*ConstArg).Val, (*arg).(*ConstArg).Size())
+				*addr += (*arg).(*ConstArg).Size()
+			} else {
+				size := target.ReadQWord(res.ResCall, deep)
+				data := target.ReadData(res.ResCall, size, deep)
+				val := binary.LittleEndian.Uint64(data)
+				(*arg).(*ConstArg).Val = val
+				//log.Logf(0, "ConstArg addr: %x val: %x size: %v\n", *addr, (*arg).(*ConstArg).Val, (*arg).(*ConstArg).Size())
+			}
+		}
+		break
+	case *ResultArg:
+		if doWhat == UpdateProg {
+			if is_pointer != 0 {
+				if v, ok := res.ResPointer[*addr]; ok {
+					val := binary.LittleEndian.Uint64(v)
+					(*arg).(*ResultArg).Val = val
+				}
+				//log.Logf(0, "ResultArg addr: %x val: %x size: %v\n", *addr, (*arg).(*ResultArg).Val, (*arg).(*ResultArg).Size())
+				*addr += (*arg).(*ResultArg).Size()
+			} else {
+				size := target.ReadQWord(res.ResCall, deep)
+				data := target.ReadData(res.ResCall, size, deep)
+				val := binary.LittleEndian.Uint64(data)
+				(*arg).(*ResultArg).Val = val
+				//log.Logf(0, "ResultArg addr: %x val: %x size: %v\n", *addr, (*arg).(*ResultArg).Val, (*arg).(*ResultArg).Size())
+			}
+		}
+		break
+	case *PointerArg:
+		var val uint64
+		if doWhat == UpdateProg {
+			var NewAddr uint64
+			var isPointer uint64
+
+			if is_pointer != 0 {
+				if v, ok := res.ResPointer[*addr]; ok {
+					val := binary.LittleEndian.Uint64(v)
+					log.Logf(0, "Address %x, val %x\n", (*arg).(*PointerArg).Address, val)
+					if (*arg).(*PointerArg).Address > 0x20000000 {
+						(*arg).(*PointerArg).Address = val - 0x20000000
+					}
+				}
+			} else {
+				size := target.ReadQWord(res.ResCall, deep)
+				data := target.ReadData(res.ResCall, size, deep)
+				val = binary.LittleEndian.Uint64(data)
+			}
+			NewAddr = 0x20000000 + (*arg).(*PointerArg).Address
+			if is_pointer == 0 && NewAddr != val {
+				log.Logf(0, "Failed to parse PointerArg, expected %x, but got %x\n", val, NewAddr)
+				return
+			}
+			isPointer = 1
+			//log.Logf(0, "PointerArg addr: %x\n", 0x20000000+(*arg).(*PointerArg).Address)
+			target.Do(deep, doWhat, &NewAddr, &isPointer, &(*arg).(*PointerArg).Res, data)
+			*addr += (*arg).(*PointerArg).Size()
+		}
+		if doWhat == MakePInfo {
+			var newDeep int
+			var isPointer uint64
+			isPointer = 1
+			res := (*arg).(*PointerArg).Res
+			count := (*pInfo)[*deep].NumOfChildren
+			for i := *deep + 1; i < 625; i++ {
+				if (*pInfo)[i].IndexOfArgs == 0 {
+					newDeep = i
+					break
+				}
+			}
+			(*pInfo)[*deep].Children[count] = newDeep
+			(*pInfo)[*deep].NumOfChildren = count + 1
+			target.Do(&newDeep, doWhat, &indexOfCurrentArgs, &isPointer, &res, pInfo)
+		}
+		break
+	case *DataArg:
+		if doWhat == UpdateProg {
+			if is_pointer != 0 {
+				if _, ok := res.ResPointer[*addr]; ok {
+					copy((*arg).(*DataArg).data, res.ResPointer[*addr])
+				}
+				//log.Logf(0, "DataArg addr: %x val: %v size: %v\n", addr, (*arg).(*DataArg).data, (*arg).(*DataArg).Size())
+				*addr += (*arg).(*DataArg).Size()
+			} else {
+				size := target.ReadQWord(res.ResCall, deep)
+				data := target.ReadData(res.ResCall, size, deep)
+				copy((*arg).(*DataArg).data, data)
+				//log.Logf(0, "DataArg addr: %x val: %v size: %v\n", addr, (*arg).(*DataArg).data, (*arg).(*DataArg).Size())
+			}
+		}
+		break
+	case *GroupArg:
+		//log.Logf(0, "Enter GroupArg")
+		if doWhat == UpdateProg {
+			for i := 0; i < len((*arg).(*GroupArg).Inner); i++ {
+				target.Do(deep, doWhat, num1, num2, &(*arg).(*GroupArg).Inner[i], data)
+			}
+		}
+		if doWhat == MakePInfo {
+			var newIndexOfCurrentArgs uint64
+			for i, a := range (*arg).(*GroupArg).Inner {
+				newIndexOfCurrentArgs = indexOfCurrentArgs + uint64(i)
+				target.Do(deep, doWhat, &indexOfArgs, &newIndexOfCurrentArgs, &a, pInfo)
+			}
+		}
+		//log.Logf(0, "Exit GroupArg")
+		break
+	case *UnionArg:
+		//log.Logf(0, "UnionArg")
+		if doWhat == UpdateProg {
+			target.Do(deep, doWhat, num1, num2, &(*arg).(*UnionArg).Option, data)
+		}
+		if doWhat == MakePInfo {
+			target.Do(deep, doWhat, &indexOfArgs, &indexOfCurrentArgs, &(*arg).(*UnionArg).Option, pInfo)
+		}
+		break
+	default:
+		//log.Logf(0, "Nontype")
+		break
+	}
+}*/
+
+func (target *Target) ParseArgType(tab string, arg *Arg, export *[]byte) {
+	last := len(*export) - 1
+	if (*export)[last] != '{' {
+		*export = append(*export, ',')
+	}
+	switch (*arg).(type) {
+	case *ConstArg:
+		val := (*arg).(*ConstArg).Val
+		*export = append(*export, []byte("ConstArg(")...)
+		*export = append(*export, []byte(strconv.FormatUint((*arg).Size(), 10))...)
+		*export = append(*export, []byte("):")...)
+		*export = append(*export, []byte(strconv.FormatUint(val, 10))...)
+		//*export += "ConstArg\\(" + strconv.FormatUint(arg.Size(), 10) + "\\):" + strconv.FormatUint(val, 10)
+		log.Logf(0, "%s |ConstType %x\n", tab, val)
+	case *ResultArg:
+		val := (*arg).(*ResultArg).Val
+		//reg := (*arg).(*ResultArg).Res.Val
+		*export = append(*export, []byte("ResultArg(")...)
+		*export = append(*export, []byte(strconv.FormatUint((*arg).Size(), 10))...)
+		*export = append(*export, []byte("):")...)
+		//*export += "ResultArg\\(" + strconv.FormatUint(arg.Size(), 10) + "\\):"
+		/*if reg != "" {
+			*export = append(*export, []byte(reg)...)
+			//*export += reg
+		}*/
+		*export = append(*export, []byte(strconv.FormatUint(val, 10))...)
+		//*export += strconv.FormatUint(val, 10)
+		log.Logf(0, "%s |ResultArg %x\n", tab, val)
+	case *PointerArg:
+		*export = append(*export, []byte("PointerArg(")...)
+		*export = append(*export, []byte(strconv.FormatUint((*arg).Size(), 10))...)
+		*export = append(*export, []byte("):{")...)
+		//*export += "PointerArg\\(" + strconv.FormatUint(arg.Size(), 10) + "\\):\\{"
+		val := (*arg).(*PointerArg).Address
+		log.Logf(0, "%s |PointerArg %x\n", tab, val)
+		target.ParseArgType(tab+" | ", &(*arg).(*PointerArg).Res, export)
+		//*export += "\\}"
+		*export = append(*export, []byte("}")...)
+	case *DataArg:
+		val := (*arg).(*DataArg).data
+		*export = append(*export, []byte("DataArg(")...)
+		*export = append(*export, []byte(strconv.FormatUint((*arg).Size(), 10))...)
+		*export = append(*export, []byte("):")...)
+		*export = append(*export, val...)
+		//*export += "DataArg\\(" + strconv.FormatUint(arg.Size(), 10) + "\\):" + string(val)
+		log.Logf(0, "%s |DataArg %s\n", tab, val)
+	case *GroupArg:
+		*export = append(*export, []byte("GroupArg(")...)
+		*export = append(*export, []byte(strconv.FormatUint((*arg).Size(), 10))...)
+		*export = append(*export, []byte("):{")...)
+		//*export += "GroupArg\\(" + strconv.FormatUint(arg.Size(), 10) + "\\):\\{"
+		log.Logf(0, "%s |GroupArg \n", tab)
+		for i := 0; i < len((*arg).(*GroupArg).Inner); i++ {
+			target.ParseArgType(tab+" | ", &(*arg).(*GroupArg).Inner[i], export)
+		}
+		*export = append(*export, []byte("}")...)
+		//*export += "\\}"
+	case *UnionArg:
+		*export = append(*export, []byte("UnionArg(")...)
+		*export = append(*export, []byte(strconv.FormatUint((*arg).Size(), 10))...)
+		*export = append(*export, []byte("):{")...)
+		//*export += "UnionArg\\(" + strconv.FormatUint(arg.Size(), 10) + "\\):\\{"
+		log.Logf(0, "%s |UnionArg\n", tab)
+		target.ParseArgType(tab+" | ", &(*arg).(*UnionArg).Option, export)
+		*export = append(*export, []byte("}")...)
+		//*export += "\\}"
+	default:
+		log.Logf(0, "%s |NoneType", tab)
+	}
+
 }
 
 func (ctx *serializer) printf(text string, args ...interface{}) {
@@ -262,6 +515,7 @@ func (p *parser) parseProg() (*Prog, error) {
 		}
 		meta := p.target.SyscallMap[name]
 		if meta == nil {
+			MissingSyscall = name
 			return nil, fmt.Errorf("unknown syscall %v", name)
 		}
 		c := &Call{

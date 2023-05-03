@@ -107,7 +107,7 @@ all: host target
 
 host:
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) install ./syz-manager
-	$(MAKE) manager runtest repro mutate prog2c db upgrade
+	$(MAKE) manager runtest repro mutate prog2c db upgrade branch2addr logparser
 
 target:
 	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) install ./syz-fuzzer
@@ -177,6 +177,11 @@ usbgen:
 expand:
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-expand github.com/google/syzkaller/tools/syz-expand
 
+branch2addr:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-branch2addr github.com/google/syzkaller/tools/syz-branch2addr
+
+logparser:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-logparser github.com/google/syzkaller/tools/syz-logparser
 # `extract` extracts const files from various kernel sources, and may only
 # re-generate parts of files.
 extract: bin/syz-extract

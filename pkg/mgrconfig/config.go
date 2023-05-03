@@ -114,4 +114,8 @@ type Config struct {
 	SyzFuzzerBin   string `json:"-"`
 	SyzExecprogBin string `json:"-"`
 	SyzExecutorBin string `json:"-"`
+	Testcase       string `json:"testcase"`
+	AnalyzerDir    string `json:"analyzer_dir"`
+	TimeLimit      string `json:"time_limit"`
+	StoreRead      bool   `json:"store_read"`
 }

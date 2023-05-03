@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/syzkaller/courier"
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/ipc"
@@ -76,12 +77,17 @@ func (proc *Proc) loop() {
 				proc.execute(proc.execOpts, item.p, item.flags, StatCandidate)
 			case *WorkSmash:
 				proc.smashInput(item)
+			case *WorkGrow:
+				proc.growInput(proc.execOpts, item, StatCandidate)
 			default:
 				log.Fatalf("unknown work type: %#v", item)
 			}
 			continue
 		}
 
+		//if prog.ExecutePoCOnly {
+		continue
+		//}
 		ct := proc.fuzzer.choiceTable
 		fuzzerSnapshot := proc.fuzzer.snapshot()
 		if len(fuzzerSnapshot.corpus) == 0 || i%generatePeriod == 0 {
@@ -177,6 +183,18 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	}
 }
 
+func (proc *Proc) growInput(execOpts *ipc.ExecOpts, item *WorkGrow, stat Stat) {
+	log.Logf(1, "#%v: growInput type=%x", proc.pid, item.flags)
+
+	proc.executeRaw(execOpts, item.p, stat)
+	fuzzerSnapshot := proc.fuzzer.snapshot()
+	for i := 0; i < 500; i++ {
+		p := item.p.Clone()
+		p.Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, fuzzerSnapshot.corpus)
+		proc.execute(proc.execOpts, p, ProgNormal, StatSmash)
+	}
+}
+
 func reexecutionSuccess(info *ipc.ProgInfo, oldInfo *ipc.CallInfo, call int) bool {
 	if info == nil || len(info.Calls) == 0 {
 		return false
@@ -208,7 +226,7 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 		proc.executeHintSeed(item.p, item.call)
 	}
 	fuzzerSnapshot := proc.fuzzer.snapshot()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 500; i++ {
 		p := item.p.Clone()
 		p.Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, fuzzerSnapshot.corpus)
 		log.Logf(1, "#%v: smash mutated", proc.pid)
@@ -250,7 +268,10 @@ func (proc *Proc) executeHintSeed(p *prog.Prog, call int) {
 func (proc *Proc) execute(execOpts *ipc.ExecOpts, p *prog.Prog, flags ProgTypes, stat Stat) *ipc.ProgInfo {
 	info := proc.executeRaw(execOpts, p, stat)
 	calls, extra := proc.fuzzer.checkNewSignal(p, info)
-	for _, callIndex := range calls {
+	for i, callIndex := range calls {
+		if i < prog.NOfCalls {
+			continue
+		}
 		proc.enqueueCallTriage(p, flags, callIndex, info.Calls[callIndex])
 	}
 	if extra {
@@ -341,5 +362,43 @@ func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) {
 		}
 	default:
 		log.Fatalf("unknown output type: %v", proc.fuzzer.outputType)
+	}
+}
+
+func (proc *Proc) checkMutatingQueueLoop() {
+	for {
+		a := &rpctype.GetQueueLenArgs{
+			Flag: courier.Mutating,
+		}
+		r := &rpctype.GetQueueLenRes{}
+		if err := proc.fuzzer.manager.Call("Manager.GetQueueLen", a, r); err != nil {
+			log.Fatalf("checkArgsQueueLoop: failed to connect to manager: %v ", err)
+		}
+		if r.Length > 0 {
+			pq := &rpctype.ProgQueue{}
+			if err := proc.fuzzer.manager.Call("Manager.RetrieveArgsQueue", pq, pq); err != nil {
+				log.Fatalf("failed to connect to manager: %v ", err)
+			}
+			log.Logf(1, "New Arg Aviable: %s\n", pq.Prog)
+			p, err := proc.fuzzer.target.Deserialize(pq.Prog, prog.NonStrict)
+			if err != nil {
+				log.Fatalf("checkArgsQueueLoop: failed to parse program from manager: %v", err)
+			}
+			//sig := hash.Hash(pq.Prog)
+			//sign := pq.Prog.Signal.Deserialize()
+			//fuzzer.addInputToCorpus(p, sign, sig)
+			flags := ProgNormal
+			prog.NOfCalls = pq.NOfCalls
+			prog.PocProg = string(pq.PocProg)
+			//if strings.Compare(string(pq.Prog), string(p.Serialize())) != 0 {
+			//prog.PocProg = string(p.Serialize())
+			//	log.Logf(0, "Prog is not minimized\n")
+			//}
+			proc.fuzzer.workQueue.enqueue(&WorkGrow{
+				p:     p,
+				flags: flags,
+			})
+		}
+		time.Sleep(10 * time.Second)
 	}
 }

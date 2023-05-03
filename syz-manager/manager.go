@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -13,10 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/syzkaller/courier"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/csource"
@@ -41,7 +45,10 @@ var (
 	flagConfig = flag.String("config", "", "configuration file")
 	flagDebug  = flag.Bool("debug", false, "dump all VM output to console")
 	flagBench  = flag.String("bench", "", "write execution statistics into this file periodically")
+	flagPoC    = flag.Bool("poc", false, "mutate base on current PoC")
 )
+
+var shutdownErr = errors.New("An error to shutdown all vms")
 
 type Manager struct {
 	cfg            *mgrconfig.Config
@@ -100,6 +107,13 @@ const (
 	// Triaged all new inputs from hub.
 	// This is when we start reproducing crashes.
 	phaseTriagedHub
+)
+
+const (
+	nonCritical = 0
+	abMemRead   = 1
+	abMemWrite  = 2
+	invalidFree = 4
 )
 
 const currentDBVersion = 4
@@ -201,7 +215,9 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, sysTarget *targets.T
 	}
 
 	go func() {
+		c := 0
 		for lastTime := time.Now(); ; {
+			c += 1
 			time.Sleep(10 * time.Second)
 			now := time.Now()
 			diff := now.Sub(lastTime)
@@ -267,6 +283,8 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, sysTarget *targets.T
 		<-vm.Shutdown
 		return
 	}
+	TestcasePath = cfg.Testcase
+	courier.AnalyzerPath = cfg.AnalyzerDir
 	mgr.vmLoop()
 }
 
@@ -311,6 +329,13 @@ func (mgr *Manager) vmLoop() {
 	reproDone := make(chan *ReproResult, 1)
 	stopPending := false
 	shutdown := vm.Shutdown
+	succeed := 0
+	start := time.Now()
+	storeRead := mgr.cfg.StoreRead
+	if storeRead {
+		log.Logf(0, "storeRead %v", storeRead)
+	}
+	report.ReadIsCritical = storeRead
 	for shutdown != nil || len(instances) != vmCount {
 		mgr.mu.Lock()
 		phase := mgr.phase
@@ -339,6 +364,11 @@ func (mgr *Manager) vmLoop() {
 		}
 
 		if shutdown != nil {
+			executed := mgr.stats.execTotal.get()
+			if executed <= 1 && time.Since(start).Seconds() > 300 && len(reproducing) == 0 {
+				log.Logf(0, "Restart syzkaller to avoid one executed")
+				os.Exit(4)
+			}
 			for canRepro() && len(instances) >= instancesPerRepro {
 				last := len(reproQueue) - 1
 				crash := reproQueue[last]
@@ -367,7 +397,14 @@ func (mgr *Manager) vmLoop() {
 				instances = instances[:last]
 				log.Logf(1, "loop: starting instance %v", idx)
 				go func() {
-					crash, err := mgr.runInstance(idx)
+					timeLimit, err := strconv.Atoi(mgr.cfg.TimeLimit)
+					if err != nil {
+						timeLimit = 8
+					}
+					crash, err := mgr.runInstance(idx, start, timeLimit)
+					if (err == shutdownErr || succeed > 5) && crash == nil && len(reproQueue)+len(pendingRepro)+len(reproducing) == 0 {
+						shutdown = nil
+					}
 					runDone <- &RunResult{idx, crash, err}
 				}()
 			}
@@ -387,6 +424,10 @@ func (mgr *Manager) vmLoop() {
 			stopPending = true
 		case res := <-runDone:
 			log.Logf(1, "loop: instance %v finished, crash=%v", res.idx, res.crash != nil)
+			if *flagPoC && res.crash != nil && res.crash.Report.Title == vm.NoOutputCrash {
+				log.Logf(0, "exit due to no output for a long time")
+				shutdown = nil
+			}
 			if res.err != nil && shutdown != nil {
 				log.Logf(0, "%v", res.err)
 			}
@@ -396,12 +437,19 @@ func (mgr *Manager) vmLoop() {
 			// which we detect as "lost connection". Don't save that as crash.
 			if shutdown != nil && res.crash != nil {
 				needRepro := mgr.saveCrash(res.crash)
-				if needRepro {
-					log.Logf(1, "loop: add pending repro for '%v'", res.crash.Title)
-					pendingRepro[res.crash] = true
+				if isCriticalCrash(res.crash.Report.Title, storeRead) > 0 {
+					if needRepro && succeed <= 5 && res.crash.Report.Title != vm.NoOutputCrash && res.crash.Report.Title != "lost connection to test machine" {
+						log.Logf(1, "loop: add pending repro for '%v'", res.crash.Title)
+						pendingRepro[res.crash] = true
+					}
 				}
 			}
 		case res := <-reproDone:
+			if res.res != nil && isCriticalCrash(res.res.Report.Title, storeRead) != nonCritical {
+				prog := res.res.Prog.Serialize()
+				courier.AppendCriticalPoCQueue(prog)
+				flagExtraMutating = true
+			}
 			atomic.AddUint32(&mgr.numReproducing, ^uint32(0))
 			crepro := false
 			title := ""
@@ -423,6 +471,28 @@ func (mgr *Manager) vmLoop() {
 				}
 			} else {
 				mgr.saveRepro(res.res, res.stats, res.hub)
+				log.Logf(0, "SaveRepro %s", res.res.Report.Title)
+				if isCriticalCrash(res.res.Report.Title, storeRead) != nonCritical {
+					succeed++
+				}
+				if (isCriticalCrash(res.res.Report.Title, storeRead) & abMemWrite) != nonCritical {
+					if succeed == 1 {
+						log.Logf(0, "Save to success file")
+						courier.SaveToFile("AbnormallyMemWrite")
+					}
+				}
+				if (isCriticalCrash(res.res.Report.Title, storeRead) & abMemRead) != nonCritical {
+					if succeed == 1 {
+						log.Logf(0, "Abnormally memory read found")
+						courier.SaveToFile("AbnormallyMemRead")
+					}
+				}
+				if (isCriticalCrash(res.res.Report.Title, storeRead) & invalidFree) != nonCritical {
+					if succeed == 1 {
+						log.Logf(0, "double free or invalid free")
+						courier.SaveToFile("DoubleFree")
+					}
+				}
 			}
 		case <-shutdown:
 			log.Logf(1, "loop: shutting down...")
@@ -528,7 +598,7 @@ func (mgr *Manager) loadCorpus() {
 	mgr.phase = phaseLoadedCorpus
 }
 
-func (mgr *Manager) runInstance(index int) (*Crash, error) {
+func (mgr *Manager) runInstance(index int, managerStart time.Time, timeLimit int) (*Crash, error) {
 	mgr.checkUsedFiles()
 	inst, err := mgr.vmPool.Create(index)
 	if err != nil {
@@ -569,14 +639,18 @@ func (mgr *Manager) runInstance(index int) (*Crash, error) {
 	defer atomic.AddUint32(&mgr.numFuzzing, ^uint32(0))
 	cmd := instance.FuzzerCmd(fuzzerBin, executorCmd, fmt.Sprintf("vm-%v", index),
 		mgr.cfg.TargetOS, mgr.cfg.TargetArch, fwdAddr, mgr.cfg.Sandbox, procs, fuzzerV,
-		mgr.cfg.Cover, *flagDebug, false, false)
+		mgr.cfg.Cover, *flagDebug, false, false, *flagPoC)
 	outc, errc, err := inst.Run(time.Hour, mgr.vmStop, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run fuzzer: %v", err)
 	}
+	prog.ExecutePoCOnly = *flagPoC
 
-	rep := inst.MonitorExecution(outc, errc, mgr.reporter, vm.ExitTimeout)
+	rep := inst.MonitorExecution(outc, errc, mgr.reporter, vm.ExitTimeout, managerStart, timeLimit)
 	if rep == nil {
+		if time.Since(managerStart) >= time.Duration(timeLimit)*time.Hour {
+			return nil, shutdownErr
+		}
 		// This is the only "OK" outcome.
 		log.Logf(0, "vm-%v: running for %v, restarting", index, time.Since(start))
 		return nil, nil
@@ -844,6 +918,12 @@ func (mgr *Manager) saveRepro(res *repro.Result, stats *repro.Stats, hub bool) {
 	}
 	if len(cprogText) > 0 {
 		osutil.WriteFile(filepath.Join(dir, "repro.cprog"), cprogText)
+	}
+	if len(res.Command) > 0 {
+		command := strings.Split(res.Command, " ")
+		command[len(command)-1] = "testcase"
+		newCommand := strings.Join(command, " ")
+		osutil.WriteFile(filepath.Join(dir, "repro.command"), []byte(newCommand))
 	}
 	saveReproStats(filepath.Join(dir, "repro.stats"), stats)
 }
@@ -1186,4 +1266,29 @@ func publicWebAddr(addr string) string {
 		}
 	}
 	return "http://" + addr
+}
+
+// return
+// 0 for Non-critical
+// 1 for Read
+// 2 for Write
+// 4 for invalid free
+func isCriticalCrash(title string, storeRead bool) int {
+	ret := nonCritical
+	if storeRead {
+		if strings.Contains(title, "out-of-bounds Read") ||
+			strings.Contains(title, "use-after-free Read") {
+			ret |= abMemRead
+		}
+	}
+
+	if strings.Contains(title, "out-of-bounds Write") ||
+		strings.Contains(title, "use-after-free Write") {
+		ret |= abMemWrite
+	}
+
+	if strings.Contains(title, "invalid-free in") {
+		ret |= invalidFree
+	}
+	return ret
 }

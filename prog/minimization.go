@@ -31,7 +31,7 @@ func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool)
 	p0, callIndex0 = removeCalls(p0, callIndex0, crash, pred)
 
 	// Try to minimize individual args.
-	for i := 0; i < len(p0.Calls); i++ {
+	for i := NOfCalls; i < len(p0.Calls); i++ {
 		ctx := &minimizeArgsCtx{
 			target:     p0.Target,
 			p0:         &p0,
@@ -60,7 +60,7 @@ func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool)
 }
 
 func removeCalls(p0 *Prog, callIndex0 int, crash bool, pred func(*Prog, int) bool) (*Prog, int) {
-	for i := len(p0.Calls) - 1; i >= 0; i-- {
+	for i := len(p0.Calls) - 1; i >= NOfCalls; i-- {
 		if i == callIndex0 {
 			continue
 		}

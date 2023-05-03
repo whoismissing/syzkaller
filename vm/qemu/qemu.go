@@ -186,7 +186,7 @@ var linuxCmdline = []string{
 	"earlyprintk=serial",
 	"oops=panic",
 	"nmi_watchdog=panic",
-	"panic_on_warn=1",
+	//"panic_on_warn=1",
 	"panic=1",
 	"ftrace_dump_on_oops=orig_cpu",
 	"rodata=n",
@@ -383,6 +383,7 @@ func (inst *instance) boot() error {
 			)
 		}
 		cmdline = append(cmdline, inst.cfg.Cmdline)
+		cmdline = append(cmdline, "kasan_multi_shot=1")
 		args = append(args,
 			"-kernel", inst.cfg.Kernel,
 			"-append", strings.Join(cmdline, " "),

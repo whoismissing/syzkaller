@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/ifuzz"
 	_ "github.com/google/syzkaller/pkg/ifuzz/generated" // pull in generated instruction descriptions
+	"github.com/google/syzkaller/pkg/log"
 )
 
 const (
@@ -700,7 +701,13 @@ func (a *ResourceType) generate(r *randGen, s *state) (arg Arg, calls []*Call) {
 			return
 		}
 	}
+	// Using previouse generated fd makes more sense for triggering PoC
+	arg = r.existingResource(s, a)
+	if arg != nil {
+		return
+	}
 	special := a.SpecialValues()
+	log.Logf(1, "No existingResource found, using SpecialValues: %x", special)
 	arg = MakeResultArg(a, nil, special[r.Intn(len(special))])
 	return
 }

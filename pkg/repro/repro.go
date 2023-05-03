@@ -29,7 +29,8 @@ type Result struct {
 	CRepro   bool
 	// Information about the final (non-symbolized) crash that we reproduced.
 	// Can be different from what we started reproducing.
-	Report *report.Report
+	Report  *report.Report
+	Command string
 }
 
 type Stats struct {
@@ -193,7 +194,7 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, reporter report.Reporter, vmPoo
 			if res.CRepro {
 				_, err = ctx.testCProg(res.Prog, res.Duration, res.Opts)
 			} else {
-				_, err = ctx.testProg(res.Prog, res.Duration, res.Opts)
+				_, _, err = ctx.testProg(res.Prog, res.Duration, res.Opts)
 			}
 			if err != nil {
 				return nil, nil, err
@@ -329,7 +330,7 @@ func (ctx *context) extractProgSingle(entries []*prog.LogEntry, duration time.Du
 		if opts.FaultCall < 0 || opts.FaultCall >= len(ent.P.Calls) {
 			opts.FaultCall = len(ent.P.Calls) - 1
 		}
-		crashed, err := ctx.testProg(ent.P, duration, opts)
+		crashed, command, err := ctx.testProg(ent.P, duration, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -338,6 +339,7 @@ func (ctx *context) extractProgSingle(entries []*prog.LogEntry, duration time.Du
 				Prog:     ent.P,
 				Duration: duration * 3 / 2,
 				Opts:     opts,
+				Command:  command,
 			}
 			ctx.reproLog(3, "single: successfully extracted reproducer")
 			return res, nil
@@ -361,7 +363,8 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 
 	// Bisect the log to find multiple guilty programs.
 	entries, err := ctx.bisectProgs(entries, func(progs []*prog.LogEntry) (bool, error) {
-		return ctx.testProgs(progs, duration(len(progs)), opts)
+		crashed, _, err := ctx.testProgs(progs, duration(len(progs)), opts)
+		return crashed, err
 	})
 	if err != nil {
 		return nil, err
@@ -386,7 +389,7 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 	dur := duration(len(entries)) * 3 / 2
 
 	// Execute the program without fault injection.
-	crashed, err := ctx.testProg(prog, dur, opts)
+	crashed, command, err := ctx.testProg(prog, dur, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -395,6 +398,7 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 			Prog:     prog,
 			Duration: dur,
 			Opts:     opts,
+			Command:  command,
 		}
 		ctx.reproLog(3, "bisect: concatenation succeeded")
 		return res, nil
@@ -409,7 +413,7 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 			if entry.FaultCall < 0 || entry.FaultCall >= len(entry.P.Calls) {
 				opts.FaultCall = calls + len(entry.P.Calls) - 1
 			}
-			crashed, err := ctx.testProg(prog, dur, opts)
+			crashed, command, err := ctx.testProg(prog, dur, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -418,6 +422,7 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 					Prog:     prog,
 					Duration: dur,
 					Opts:     opts,
+					Command:  command,
 				}
 				ctx.reproLog(3, "bisect: concatenation succeeded with fault injection")
 				return res, nil
@@ -444,7 +449,7 @@ func (ctx *context) minimizeProg(res *Result) (*Result, error) {
 	}
 	res.Prog, res.Opts.FaultCall = prog.Minimize(res.Prog, call, true,
 		func(p1 *prog.Prog, callIndex int) bool {
-			crashed, err := ctx.testProg(p1, res.Duration, res.Opts)
+			crashed, _, err := ctx.testProg(p1, res.Duration, res.Opts)
 			if err != nil {
 				ctx.reproLog(0, "minimization failed with %v", err)
 				return false
@@ -468,7 +473,7 @@ func (ctx *context) simplifyProg(res *Result) (*Result, error) {
 		if !simplify(&opts) {
 			continue
 		}
-		crashed, err := ctx.testProg(res.Prog, res.Duration, opts)
+		crashed, command, err := ctx.testProg(res.Prog, res.Duration, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -476,6 +481,7 @@ func (ctx *context) simplifyProg(res *Result) (*Result, error) {
 			continue
 		}
 		res.Opts = opts
+		res.Command = command
 		// Simplification successful, try extracting C repro.
 		res, err = ctx.extractC(res)
 		if err != nil {
@@ -528,7 +534,7 @@ func (ctx *context) simplifyC(res *Result) (*Result, error) {
 	return res, nil
 }
 
-func (ctx *context) testProg(p *prog.Prog, duration time.Duration, opts csource.Options) (crashed bool, err error) {
+func (ctx *context) testProg(p *prog.Prog, duration time.Duration, opts csource.Options) (crashed bool, command string, err error) {
 	entry := prog.LogEntry{P: p}
 	if opts.Fault {
 		entry.Fault = true
@@ -539,25 +545,25 @@ func (ctx *context) testProg(p *prog.Prog, duration time.Duration, opts csource.
 }
 
 func (ctx *context) testProgs(entries []*prog.LogEntry, duration time.Duration, opts csource.Options) (
-	crashed bool, err error) {
+	crashed bool, command string, err error) {
 	inst := <-ctx.instances
 	if inst == nil {
-		return false, fmt.Errorf("all VMs failed to boot")
+		return false, "", fmt.Errorf("all VMs failed to boot")
 	}
 	defer ctx.returnInstance(inst)
 	if len(entries) == 0 {
-		return false, fmt.Errorf("no programs to execute")
+		return false, "", fmt.Errorf("no programs to execute")
 	}
 
 	pstr := encodeEntries(entries)
 	progFile, err := osutil.WriteTempFile(pstr)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	defer os.Remove(progFile)
 	vmProgFile, err := inst.Copy(progFile)
 	if err != nil {
-		return false, fmt.Errorf("failed to copy to VM: %v", err)
+		return false, "", fmt.Errorf("failed to copy to VM: %v", err)
 	}
 
 	if !opts.Fault {
@@ -575,7 +581,7 @@ func (ctx *context) testProgs(entries []*prog.LogEntry, duration time.Duration, 
 		program += "]"
 	}
 
-	command := instancePkg.ExecprogCmd(inst.execprogBin, inst.executorBin,
+	command = instancePkg.ExecprogCmd(inst.execprogBin, inst.executorBin,
 		ctx.cfg.TargetOS, ctx.cfg.TargetArch, opts.Sandbox, opts.Repeat,
 		opts.Threaded, opts.Collide, opts.Procs, -1, -1, vmProgFile)
 	ctx.reproLog(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
@@ -594,49 +600,49 @@ func (ctx *context) testCProg(p *prog.Prog, duration time.Duration, opts csource
 	}
 	defer os.Remove(bin)
 	ctx.reproLog(2, "testing compiled C program (duration=%v, %+v): %s", duration, opts, p)
-	crashed, err = ctx.testBin(bin, duration)
+	crashed, _, err = ctx.testBin(bin, duration)
 	if err != nil {
 		return false, err
 	}
 	return crashed, nil
 }
 
-func (ctx *context) testBin(bin string, duration time.Duration) (crashed bool, err error) {
+func (ctx *context) testBin(bin string, duration time.Duration) (crashed bool, command string, err error) {
 	inst := <-ctx.instances
 	if inst == nil {
-		return false, fmt.Errorf("all VMs failed to boot")
+		return false, bin, fmt.Errorf("all VMs failed to boot")
 	}
 	defer ctx.returnInstance(inst)
 
 	bin, err = inst.Copy(bin)
 	if err != nil {
-		return false, fmt.Errorf("failed to copy to VM: %v", err)
+		return false, bin, fmt.Errorf("failed to copy to VM: %v", err)
 	}
 	return ctx.testImpl(inst.Instance, bin, duration)
 }
 
-func (ctx *context) testImpl(inst *vm.Instance, command string, duration time.Duration) (crashed bool, err error) {
+func (ctx *context) testImpl(inst *vm.Instance, command string, duration time.Duration) (crashed bool, commands string, err error) {
 	outc, errc, err := inst.Run(duration, nil, command)
 	if err != nil {
-		return false, fmt.Errorf("failed to run command in VM: %v", err)
+		return false, command, fmt.Errorf("failed to run command in VM: %v", err)
 	}
 	rep := inst.MonitorExecution(outc, errc, ctx.reporter,
-		vm.ExitTimeout|vm.ExitNormal|vm.ExitError)
+		vm.ExitTimeout|vm.ExitNormal|vm.ExitError, time.Now(), -1)
 	if rep == nil {
 		ctx.reproLog(2, "program did not crash")
-		return false, nil
+		return false, command, nil
 	}
 	if rep.Suppressed {
 		ctx.reproLog(2, "suppressed program crash: %v", rep.Title)
-		return false, nil
+		return false, command, nil
 	}
 	if ctx.crashType == report.MemoryLeak && rep.Type != report.MemoryLeak {
 		ctx.reproLog(2, "not a leak crash: %v", rep.Title)
-		return false, nil
+		return false, command, nil
 	}
 	ctx.report = rep
 	ctx.reproLog(2, "program crashed: %v", rep.Title)
-	return true, nil
+	return true, command, nil
 }
 
 func (ctx *context) returnInstance(inst *instance) {

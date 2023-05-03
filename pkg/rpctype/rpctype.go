@@ -128,3 +128,27 @@ type RunTestDoneArgs struct {
 	Info   []*ipc.ProgInfo
 	Error  string
 }
+
+type ProgQueue struct {
+	Length   int
+	Prog     []byte
+	NOfCalls int
+	PocProg  []byte
+}
+
+type GetQueueLenArgs struct {
+	Flag int
+}
+
+type GetQueueLenRes struct {
+	Length int
+}
+
+type FuzzerSignal struct {
+	Signal string
+}
+
+type GetCallsFromFuzzerArgs struct {
+	EnabledCalls map[string][]int
+	Sandbox      string
+}

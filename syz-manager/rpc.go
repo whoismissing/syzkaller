@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/google/syzkaller/courier"
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/rpctype"
@@ -54,6 +56,7 @@ type RPCManagerView interface {
 	newInput(inp rpctype.RPCInput, sign signal.Signal) bool
 	candidateBatch(size int) []rpctype.RPCCandidate
 	rotateCorpus() bool
+	parseCustomizedTestcase(a rpctype.GetCallsFromFuzzerArgs, ch chan int)
 }
 
 func startRPCServer(mgr *Manager) (int, error) {
@@ -307,5 +310,52 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 	}
 	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v",
 		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems))
+	return nil
+}
+
+func (serv *RPCServer) GetQueueLen(a *rpctype.GetQueueLenArgs, r *rpctype.GetQueueLenRes) error {
+	switch a.Flag {
+	case courier.Mutating:
+		r.Length = len(courier.MutateArgsQueue)
+		break
+	case courier.Commands:
+		r.Length = len(courier.CommandsQueue)
+		break
+	case courier.S2E:
+		r.Length = len(courier.S2EArgsQueue)
+	}
+	return nil
+}
+
+func (serv *RPCServer) RetrieveArgsQueue(a *rpctype.ProgQueue, pq *rpctype.ProgQueue) error {
+	courier.Mutex.Lock()
+	p := courier.RetrieveFirstArg(courier.Mutating)
+	if p != nil {
+		*pq = p.(rpctype.ProgQueue)
+	}
+	courier.Mutex.Unlock()
+	return nil
+}
+
+func (serv *RPCServer) EmitSignal(a *rpctype.FuzzerSignal, pq *rpctype.FuzzerSignal) error {
+	courier.Mutex.Lock()
+	sg := a.Signal
+	log.Logf(0, "A signal from fuzzer: %s\n", sg)
+	courier.Mutex.Unlock()
+	return nil
+}
+
+func (serv *RPCServer) GetCallsFromFuzzer(a *rpctype.GetCallsFromFuzzerArgs, r *int) error {
+	ch := make(chan int)
+
+	go serv.mgr.parseCustomizedTestcase(*a, ch)
+	exitcode := <-ch
+	if exitcode == -1 {
+		os.Exit(3)
+	}
+	/*err := serv.mgr.parseCustomizedTestcase(*a)
+	if err != nil {
+		log.Logf(0, "%v", err)
+	}*/
 	return nil
 }

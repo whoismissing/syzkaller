@@ -83,6 +83,8 @@ func (t Type) String() string {
 	}
 }
 
+var ReadIsCritical bool
+
 // NewReporter creates reporter for the specified OS/Type.
 func NewReporter(cfg *mgrconfig.Config) (Reporter, error) {
 	typ := cfg.TargetOS

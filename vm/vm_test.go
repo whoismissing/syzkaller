@@ -218,7 +218,7 @@ var tests = []*Test{
 		Body: func(outc chan []byte, errc chan error) {
 		},
 		Report: &report.Report{
-			Title: noOutputCrash,
+			Title: NoOutputCrash,
 		},
 	},
 	{
@@ -230,7 +230,7 @@ var tests = []*Test{
 			}
 		},
 		Report: &report.Report{
-			Title: noOutputCrash,
+			Title: NoOutputCrash,
 		},
 	},
 	{
@@ -345,7 +345,7 @@ func testMonitorExecution(t *testing.T, test *Test) {
 		test.Body(testInst.outc, testInst.errc)
 		done <- true
 	}()
-	rep := inst.MonitorExecution(outc, errc, reporter, test.Exit)
+	rep := inst.MonitorExecution(outc, errc, reporter, test.Exit, time.Now(), -1)
 	<-done
 	if test.Report != nil && rep == nil {
 		t.Fatalf("got no report")
