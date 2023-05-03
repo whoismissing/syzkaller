@@ -14,8 +14,9 @@ build_ka_func = \
 			LLVM_LIBRARY_DIRS=${LLVM_BUILD}/lib \
 			LLVM_INCLUDE_DIRS=${LLVM_BUILD}/include \
 			CC=clang CXX=clang++ \
-            cmake ${1} -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_CXX_FLAGS_RELEASE="-std=c++11 -fno-rtti -fpic" \
+            cmake ${1} \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_FLAGS_RELEASE="-std=c++14 -fno-rtti -fpic -g" \
 		&& make -j${NPROC})
 
 all: KAMain

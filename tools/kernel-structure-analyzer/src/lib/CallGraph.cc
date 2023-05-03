@@ -18,11 +18,11 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Analysis/CallGraph.h>
+#include <llvm/IR/CallSite.h>
 
 #include "CallGraph.h"
 #include "Annotation.h"
 
-//#define TYPE_BASED
 
 using namespace llvm;
 
@@ -116,7 +116,7 @@ bool CallGraphPass::isCompatibleType(Type *T1, Type *T2) {
         }
         return true;
     } else {
-        errs() << "Unhandled Types:" << *T1 << " :: " << *T2 << "\n";
+        // errs() << "Unhandled Types:" << *T1 << " :: " << *T2 << "\n";
         return T1->getTypeID() == T2->getTypeID();
     }
 }
@@ -289,7 +289,7 @@ bool CallGraphPass::findFunctions(Value *V, FuncSet &S,
             return mergeFuncSet(S, Id, InsertEmpty);
         } else {
             Function *f = L->getParent()->getParent();
-            errs() << "Empty LoadID: " << f->getName() << "::" << *L << "\n";
+            // errs() << "Empty LoadID: " << f->getName() << "::" << *L << "\n";
             return false;
         }
     }
@@ -300,7 +300,7 @@ bool CallGraphPass::findFunctions(Value *V, FuncSet &S,
 
     //V->dump();
     //report_fatal_error("findFunctions: unhandled value type\n");
-    errs() << "findFunctions: unhandled value type: " << *V << "\n";
+    // errs() << "findFunctions: unhandled value type: " << *V << "\n";
     return false;
 }
 
@@ -327,6 +327,10 @@ bool CallGraphPass::findCallees(CallInst *CI, FuncSet &FS) {
 }
 
 bool CallGraphPass::runOnFunction(Function *F) {
+
+    // Lewis: we don't give a shit to functions in .init.text
+    if(F->hasSection() && F->getSection().str() == ".init.text")
+        return false;
     bool Changed = false;
 
     for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
@@ -378,7 +382,7 @@ bool CallGraphPass::runOnFunction(Function *F) {
                     findFunctions(V, FS);
                     Changed |= mergeFuncSet(Id, FS, isFunctionPointer(V->getType()));
                 } else {
-                    errs() << "Empty StoreID: " << F->getName() << "::" << *SI << "\n";
+                    // errs() << "Empty StoreID: " << F->getName() << "::" << *SI << "\n";
                 }
             }
         } else if (ReturnInst *RI = dyn_cast<ReturnInst>(I)) {
@@ -402,9 +406,14 @@ void CallGraphPass::processInitializers(Module *M, Constant *C, GlobalValue *V, 
     // structs
     if (ConstantStruct *CS = dyn_cast<ConstantStruct>(C)) {
         StructType *STy = CS->getType();
-        if (!STy->hasName() && Id.empty()) {
-            Id = getVarId(V);
+
+        if (!STy->hasName() && Id.empty()) {            
+            if (V != nullptr)
+                Id = getVarId(V);
+            else 
+                Id = "bullshit"; // Lewis: quick fix for V is nullptr
         }
+
         for (unsigned i = 0; i != STy->getNumElements(); ++i) {
             Type *ETy = STy->getElementType(i);
             if (ETy->isStructTy()) {
@@ -453,6 +462,7 @@ void CallGraphPass::processInitializers(Module *M, Constant *C, GlobalValue *V, 
 
 bool CallGraphPass::doInitialization(Module *M) {
 
+    KA_LOGS(1, "[+] Initializing " << M->getModuleIdentifier());
     // collect function pointer assignments in global initializers
     for (GlobalVariable &G : M->globals()) {
         if (G.hasInitializer())
@@ -460,6 +470,9 @@ bool CallGraphPass::doInitialization(Module *M) {
     }
 
     for (Function &F : *M) { 
+        // Lewis: we don't give a shit to functions in .init.text
+        if(F.hasSection() && F.getSection().str() == ".init.text")
+            continue;
         // collect address-taken functions
         if (F.hasAddressTaken())
             Ctx->AddressTakenFuncs.insert(&F);
@@ -470,7 +483,7 @@ bool CallGraphPass::doInitialization(Module *M) {
 
 bool CallGraphPass::doFinalization(Module *M) {
 
-    // update callee mapping
+    // update callee and caller mapping
     for (Function &F : *M) {
         for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
             // map callsite to possible callees
@@ -526,14 +539,21 @@ void CallGraphPass::dumpCallees() {
         CallInst *CI = i->first;
         FuncSet &v = i->second;
         // only dump indirect call?
-        if (CI->isInlineAsm() || CI->getCalledFunction() /*|| v.empty()*/)
+        /*
+        if (CI->isInlineAsm() || CI->getCalledFunction() || v.empty())
              continue;
+         */
 
+
+        Function* F = CI->getParent()->getParent();
+        OS << "Caller:" << F->getName().str() << ";";
+        /*
         OS << "CS:" << *CI << "\n";
         const DebugLoc &LOC = CI->getDebugLoc();
         OS << "LOC: ";
         LOC.print(OS);
         OS << "^@^";
+        */
 #if 0
         for (FuncSet::iterator j = v.begin(), ej = v.end();
              j != ej; ++j) {
@@ -542,19 +562,20 @@ void CallGraphPass::dumpCallees() {
             OS << (*j)->getName() << "::";
         }
 #endif
-        OS << "\n";
 
         v = Ctx->Callees[CI];
-        OS << "Callees: ";
+        OS << "Callees";
         for (FuncSet::iterator j = v.begin(), ej = v.end();
              j != ej; ++j) {
-            OS << (*j)->getName() << "::";
+            OS << ":" << (*j)->getName();
         }
-        OS << "\n";
+        /*
         if (v.empty()) {
             OS << "!!EMPTY =>" << *CI->getCalledValue()<<"\n";
             OS<< "Uninitialized function pointer is dereferenced!\n";
         }
+        */
+        OS << "\n";
     }
     RES_REPORT("\n[End of dumpCallees]\n");
 }

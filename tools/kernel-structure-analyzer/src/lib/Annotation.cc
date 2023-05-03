@@ -24,7 +24,6 @@
 #include <llvm/Transforms/Utils/Local.h>
 
 #include "Annotation.h"
-#include "Flags.h"
 #include "Common.h"
 
 using namespace llvm;
@@ -240,9 +239,11 @@ std::string getStoreId(StoreInst *SI) {
 }
 
 std::string getLoadId(LoadInst *LI) {
+  Function* f = LI->getParent()->getParent();
 	StringRef Id = getLoadStoreId(LI);
-	if (!Id.empty())
+	if (!Id.empty()) {
 		return Id.str();
+  }
 
 	std::string Anno;
 	LLVMContext &VMCtx = LI->getContext();
@@ -257,17 +258,58 @@ std::string getLoadId(LoadInst *LI) {
 	return Anno;
 }
 
-std::string getStructId(Value *PVal, User::op_iterator &IS, User::op_iterator &IE, Module *M) {
+std::string getStructId(Value *PVal, User::op_iterator &IS, User::op_iterator &IE, Module *M, bool debug) {
+    if (debug)
+        fprintf(stderr, "debug mode in getStructId()\n");
 
-	Type *PTy = PVal->getType();
-	StructType *STy = nullptr;
+    StructType* STy = nullptr;
+
+    Type *PTy = PVal->getType();
+    if (PointerType* PtrTy = dyn_cast<PointerType>(PTy) ) {
+        STy = dyn_cast<StructType>(PtrTy->getElementType());
+        if (!STy) {
+        /*
+            Type* ETy = PtrTy->getElementType();
+            llvm::Type::TypeID ETid = ETy->getTypeID();
+            fprintf(stderr, "TypeID: %u\n", ETid);
+        */
+            return "";
+        }
+    } else {
+        fprintf(stderr, "[-] getStructId: PVal is not a pointer type\n");
+        return "";
+    }
+    /*
+    } else if (StructType* s = dyn_cast<StructType>(PVal)) {
+        STy = s;
+    }
+    */
+
+	// StructType *STy = nullptr;
+  /*
 	for (++IE; IS != IE; ++IS) {
 		CompositeType *CT = dyn_cast<CompositeType>(PTy);
-		if (!CT) break;
-		if ((STy = dyn_cast<StructType>(CT))) break;
-		if (!CT->indexValid(*IS)) break;
+		if (!CT) {
+			if (debug)
+				fprintf(stderr, "debug mode in getStructId(), 3\n");
+			break;
+		}
+		if ((STy = dyn_cast<StructType>(CT)))  {
+			if (debug)
+				fprintf(stderr, "debug mode in getStructId(), 4\n");
+			break;
+		}
+		if (!CT->indexValid(*IS)) {
+			if (debug)
+				fprintf(stderr, "debug mode in getStructId(), 5\n");
+			break;
+		}
 		PTy = CT->getTypeAtIndex(*IS);
 	}
+	if (STy && debug)
+    fprintf(stderr, "debug mode in getStructId(), 2\n");
+    */
+
 
 	if (STy && !STy->isOpaque() && !STy->isLiteral()) {
 		std::string out;
@@ -286,15 +328,37 @@ std::string getStructId(Value *PVal, User::op_iterator &IS, User::op_iterator &I
 				return "";
 		}
 
-		rso << structName;
-		for (; IS != IE; ++IS) {
-			rso << ",";
-			ConstantInt *Idx = dyn_cast<ConstantInt>(*IS);
-			if (Idx)
-				rso << Idx->getZExtValue();
-			else
-				(*IS)->printAsOperand(rso);
-		}
+/*
+    std::size_t first = structName.find_first_of(".");
+    std::size_t last = structName.find_last_of(".");
+    if (first != last)
+      rso << structName.substr(0, last);
+    else
+      rso << structName;
+      */
+      rso << structName;
+
+      Value* Idx = *(IE);
+      if (ConstantInt* C = dyn_cast<ConstantInt>(Idx)) {
+        rso << "," <<  C->getZExtValue();
+      }
+        
+      
+
+    /*
+    for (; IS != IE; ++IS) {
+        rso << ",";
+        ConstantInt *Idx = dyn_cast<ConstantInt>(*IS);
+        if (Idx)
+            rso << (Idx->getZExtValue());
+        else
+            (*IS)->printAsOperand(rso);
+    }
+    */
+
+
+    if (debug)
+      fprintf(stderr, "struct id: %s\n", rso.str().c_str());
 		return rso.str();
 	}
 	return "";
@@ -339,7 +403,7 @@ std::string getAnonStructId(Value *V, Module *M, StringRef Prefix) {
 				return getVarId(GV);
 			}
 
-			std::string structId = getStructId(PVal, is, ie, M);
+			std::string structId = getStructId(PVal, is, ie, M, false);
 			if (!structId.empty())
 				return structId;
 		}
@@ -373,10 +437,11 @@ std::string getAnonStructId(Value *V, Module *M, StringRef Prefix) {
 		break;
 	}
 
-	return Prefix;
+	return Prefix.str();
 }
 
 std::string getAnnotation(Value *V, Module *M) {
+  bool debug = false;
 
 	SmallPtrSet<Value*, 16> Visited;
 	SmallVector<Value*, 8> WorkList;
@@ -400,6 +465,13 @@ std::string getAnnotation(Value *V, Module *M) {
 			is = GEP->idx_begin();
 			ie = GEP->idx_end() - 1;
 			PVal = GEP->getPointerOperand();
+            Function* f = GEP->getParent()->getParent();
+            if (f->getName().str() == "vfs_llseek" || 
+                f->getName().str() == "do_iter_readv_writev") {\
+                v->print(errs());
+                fprintf(stderr, "\n");
+                debug = true;
+            }
 		} else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(v)) {
 			// constant GEP expression
 			if (CE->getOpcode() == Instruction::GetElementPtr) {
@@ -415,7 +487,7 @@ std::string getAnnotation(Value *V, Module *M) {
 
 		// id is in the form of struct.[name].[offset]
 		if (PVal) {
-			std::string structId = getStructId(PVal, is, ie, M);
+			std::string structId = getStructId(PVal, is, ie, M, debug);
 			if (!structId.empty()) {
 				return structId;
 			} else {

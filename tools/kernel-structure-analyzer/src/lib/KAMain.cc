@@ -28,10 +28,10 @@
 #include <sstream>
 #include <sys/resource.h>
 
-#include "Global.h"
+#include "StructFinder.h"
 #include "CallGraph.h"
-#include "Pass.h"
-#include "PointTo.h"
+#include "Common.h"
+
 
 using namespace llvm;
 
@@ -39,96 +39,64 @@ cl::list<std::string> InputFilenames(
   cl::Positional, cl::OneOrMore, cl::desc("<input bitcode files>"));
 
 cl::opt<unsigned> VerboseLevel(
-  "htleak-verbose", cl::desc("Print information about actions taken"),
+  "debug-verbose", cl::desc("Print information about actions taken"),
   cl::init(0));
 
-cl::opt<bool> DumpCallees(
-  "dump-call-graph", cl::desc("Dump call graph"), cl::NotHidden, cl::init(false));
+cl::list<std::string> TargetStruct(
+  "target-struct", cl::desc("target struct we are looking for"));
 
-cl::opt<bool> DumpCallers(
-  "dump-caller-graph", cl::desc("Dump caller graph"), cl::NotHidden, cl::init(false));
 
-cl::opt<bool> DoSafeStack(
-  "safe-stack", cl::desc("Perfrom safe stack analysis"), cl::NotHidden, cl::init(false));
-
-cl::opt<bool> DumpStackStats(
-  "dump-stack-stats", cl::desc("Dump stack stats"), cl::NotHidden, cl::init(false));
-
-cl::opt<bool> DoLSS(
-  "linux-ss", cl::desc("Discover security sensitive data in Linux kernel"),
-  cl::NotHidden, cl::init(false));
 
 GlobalContext GlobalCtx;
 
-#define Diag llvm::errs()
 
 void IterativeModulePass::run(ModuleList &modules) {
-
   ModuleList::iterator i, e;
-  Diag << "[" << ID << "] Initializing " << modules.size() << " modules ";
+
+  KA_LOGS(1, "[" << ID << "] Initializing " << modules.size() << " modules.\n");
   bool again = true;
   while (again) {
     again = false;
     for (i = modules.begin(), e = modules.end(); i != e; ++i) {
+      KA_LOGS(1, "[" << i->second << "]\n");
       again |= doInitialization(i->first);
-      Diag << ".";
     }
   }
-  Diag << "\n";
 
+  KA_LOGS(1, "[" << ID << "] Processing " << modules.size() << " modules.\n");
   unsigned iter = 0, changed = 1;
   while (changed) {
     ++iter;
     changed = 0;
     for (i = modules.begin(), e = modules.end(); i != e; ++i) {
-      Diag << "[" << ID << " / " << iter << "] ";
+      KA_LOGS(1, "[" << ID << " / " << iter << "] ");
       // FIXME: Seems the module name is incorrect, and perhaps it's a bug.
-      Diag << "[" << i->second << "]\n";
+      KA_LOGS(1, "[" << i->second << "]\n");
 
       bool ret = doModulePass(i->first);
       if (ret) {
         ++changed;
-        Diag << "\t [CHANGED]\n";
+        KA_LOGS(1, "\t [CHANGED]\n");
       } else
-        Diag << "\n";
+        KA_LOGS(1, "\n");
     }
-    Diag << "[" << ID << "] Updated in " << changed << " modules.\n";
+    KA_LOGS(1, "[" << ID << "] Updated in " << changed << " modules.\n");
   }
 
-  Diag << "[" << ID << "] Postprocessing ...\n";
+  KA_LOGS(1, "[" << ID << "] Finalizing " << modules.size() << " modules.\n");
   again = true;
   while (again) {
     again = false;
     for (i = modules.begin(), e = modules.end(); i != e; ++i) {
-      // TODO: Dump the results.
       again |= doFinalization(i->first);
     }
   }
 
-  Diag << "[" << ID << "] Done!\n\n";
+  KA_LOGS(1, "[" << ID << "] Done!\n\n");
 }
 
 void doBasicInitialization(Module *M) {
-  // struct analysis
-  GlobalCtx.structAnalyzer.run(M, &(M->getDataLayout()));
 
-  // collect global object definitions
-  for (GlobalVariable &G : M->globals()) {
-    if (G.hasExternalLinkage())
-      GlobalCtx.Gobjs[G.getName()] = &G;
-  }
-
-  // collect global function definitions
-  for (Function &F : *M) {
-    if (F.hasExternalLinkage() && !F.empty()) {
-      // external linkage always ends up with the function name
-      std::string FName = F.getName().str();
-      if (FName.find("SyS_") == 0)
-        FName = "sys_" + FName.substr(4);
-      assert(GlobalCtx.Funcs.count(FName) == 0);
-      GlobalCtx.Funcs[FName] = &F;
-    }
-  }
 }
 
 int main(int argc, char **argv) {
@@ -149,24 +117,24 @@ int main(int argc, char **argv) {
 #endif
   PrettyStackTraceProgram X(argc, argv);
 
-  llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
+  // Call llvm_shutdown() on exit.
+  llvm_shutdown_obj Y;  
 
   cl::ParseCommandLineOptions(argc, argv, "global analysis\n");
   SMDiagnostic Err;
 
-  // Loading modules
-  Diag << "Total " << InputFilenames.size() << " file(s)\n";
+  // Load modules
+  KA_LOGS(1, "Total " << InputFilenames.size() << " file(s)\n");
 
   for (unsigned i = 0; i < InputFilenames.size(); ++i) {
-    // use separate LLVMContext to avoid type renaming
-    Diag << "Input Filename : "<< InputFilenames[i] << "\n";
+    // Use separate LLVMContext to avoid type renaming
+    KA_LOGS(1, "[" << i << "] " << InputFilenames[i] << "\n");
 
     LLVMContext *LLVMCtx = new LLVMContext();
     std::unique_ptr<Module> M = parseIRFile(InputFilenames[i], Err, *LLVMCtx);
 
     if (M == NULL) {
-      errs() << argv[0] << ": error loading file '"
-        << InputFilenames[i] << "'\n";
+      errs() << argv[0] << ": error loading file '" << InputFilenames[i] << "'\n";
       continue;
     }
 
@@ -178,41 +146,18 @@ int main(int argc, char **argv) {
     doBasicInitialization(Module);
   }
 
-  // initialize nodefactory
-  GlobalCtx.nodeFactory.setStructAnalyzer(&GlobalCtx.structAnalyzer);
-  GlobalCtx.nodeFactory.setGobjMap(&GlobalCtx.Gobjs);
-  GlobalCtx.nodeFactory.setFuncMap(&GlobalCtx.Funcs);
+  KA_LOGS(1, "Total " << TargetStruct.size() << " struct(s)\n");
+  for(unsigned i = 0; i < TargetStruct.size(); i++) {
+    KA_LOGS(1, "Adding " << TargetStruct[i] << "\n");
+    GlobalCtx.CriticalObj.insert(TargetStruct[i]);
+  }
 
-  populateNodeFactory(GlobalCtx);
-
-  // Main workflow
   CallGraphPass CGPass(&GlobalCtx);
   CGPass.run(GlobalCtx.Modules);
-  //CGPass.dumpFuncPtrs();
 
-  if (DumpCallees)
-    CGPass.dumpCallees();
-
-  if (DumpCallers)
-    CGPass.dumpCallers();
-
-  if (DoSafeStack) {
-#ifdef DO_RANGE_ANALYSIS
-    RangePass RPass(&GlobalCtx);
-    RPass.run(GlobalCtx.Modules);
-#endif
-
-    SafeStackPass SSPass(&GlobalCtx);
-    SSPass.run(GlobalCtx.Modules);
-    if (DumpStackStats)
-      SSPass.dumpStats();
-  }
-
-  if (DoLSS) {
-    LinuxSS LSS(&GlobalCtx);
-    LSS.run(GlobalCtx.Modules);
-  }
+  StructFinderPass SFPass(&GlobalCtx);
+  SFPass.run(GlobalCtx.Modules);
+  SFPass.dumpLoc();
 
   return 0;
 }
-

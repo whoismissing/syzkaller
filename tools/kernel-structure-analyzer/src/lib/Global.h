@@ -21,20 +21,28 @@
 #include <string>
 
 #include "Common.h"
-#include "StructAnalyzer.h"
-#include "NodeFactory.h"
+
+using namespace llvm;
+using namespace std;
 
 typedef std::vector< std::pair<llvm::Module*, llvm::StringRef> > ModuleList;
 typedef std::unordered_map<llvm::Module*, llvm::StringRef> ModuleMap;
+typedef std::set<llvm::Value *> VSet;
+
+
 typedef std::unordered_map<std::string, llvm::Function*> FuncMap;
 typedef std::unordered_map<std::string, llvm::GlobalVariable*> GObjMap;
+typedef std::unordered_map<std::string, llvm::Instruction*> TypeMap;
 
+/****************** Call Graph **************/
+typedef unordered_map<string, llvm::Function*> NameFuncMap;
 typedef llvm::SmallPtrSet<llvm::CallInst*, 8> CallInstSet;
-typedef llvm::SmallPtrSet<llvm::Function*, 8> FuncSet;
+typedef llvm::SmallPtrSet<llvm::Function*, 32> FuncSet;
 typedef std::unordered_map<std::string, FuncSet> FuncPtrMap;
-
 typedef llvm::DenseMap<llvm::Function*, CallInstSet> CallerMap;
 typedef llvm::DenseMap<llvm::CallInst*, FuncSet> CalleeMap;
+/****************** end Call Graph **************/
+
 
 class GlobalContext {
 private:
@@ -60,8 +68,10 @@ public:
       return nullptr;
   }
 
-  // StructAnalyzer
-  StructAnalyzer structAnalyzer;
+  typedef std::set<llvm::StringRef> StrSet;
+  StrSet CriticalObj;
+  std::set<string> objects;
+  std::map<string, size_t> structInfo;
 
   // Map global object name to object definition
   GObjMap Gobjs;
@@ -84,11 +94,29 @@ public:
   // Indirect call instructions
   std::vector<CallInst *>IndirectCallInsts;
 
-  // A factory object that knows how to manage AndersNodes
-  AndersNodeFactory nodeFactory;
+  // Map function signature to functions
+  DenseMap<size_t, FuncSet>sigFuncsMap;
+
+  // Map global function name to function.
+  NameFuncMap GlobalFuncs;
+
+  // Unified functions -- no redundant inline functions
+  DenseMap<size_t, Function *>UnifiedFuncMap;
+  set<Function *>UnifiedFuncSet;
+
+  // structs identified
+  std::set<llvm::StringRef> CriticalSt;
+
+  // type map for optimization
+  TypeMap TypeMaps;
+
+  // graph
+  std::map<StringRef, set<StringRef>> IncomingNode;
+  std::map<StringRef, set<StringRef>> OutgoingNode;
+  std::map<StringRef, size_t> ObjMap;
+
 
   ModuleList Modules;
-
   ModuleMap ModuleMaps;
   std::set<std::string> InvolvedModules;
 };
